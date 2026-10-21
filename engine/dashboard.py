@@ -180,6 +180,22 @@ def _in_session(now=None):
     return ("09:30" <= t <= "11:30") or ("13:00" <= t <= "15:00")
 
 
+def _ledger_last_ts():
+    """账本最后一次被写入的时刻（account.json 的 mtime）。
+
+    heartbeat.json 只存在于「跑过 runner 的那台机器」的 state/ 里：
+    GitHub Actions 每轮全是新 checkout（该文件未入库），push_cloud 也只推
+    account/trades/equity 三个账本文件，所以云端容器里通常没有心跳。
+    没有它就断言"账本还没有任何执行记录"是错的——账本里明明有流水，
+    这句话会让人以为账本空了。用它兜底，至少反映账本真实被写的时刻。
+    """
+    try:
+        ts = os.path.getmtime(os.path.join(broker.STATE, "account.json"))
+    except OSError:
+        return ""
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+
+
 def exec_note(pool, acc=None):
     """执行状态条：把「这一刻的条件」和「账本执行到哪」摊开讲。
 
@@ -219,7 +235,13 @@ def exec_note(pool, acc=None):
         hot_txt = ""
 
     if not last:
-        return ('<div class="execnote warn">账本还没有任何执行记录</div>')
+        # 心跳缺失不等于没执行过。先按账本写入时刻兜底，实在没有才说空。
+        last = _ledger_last_ts()
+        hb_missing = bool(last)
+        if not last:
+            return ('<div class="execnote warn">账本与执行心跳都为空：还没有执行记录</div>')
+    else:
+        hb_missing = False
 
     try:
         dt = datetime.strptime(last, "%Y-%m-%d %H:%M:%S")
@@ -227,6 +249,10 @@ def exec_note(pool, acc=None):
         return ('<div class="execnote warn">账本最后执行：%s</div>' % last)
 
     sec = (datetime.now() - dt).total_seconds()
+
+    if hb_missing:
+        # 说清楚口径，否则「最后执行 11:32」会被当成真实心跳时间
+        hot_txt += "　｜　执行心跳缺失，此时间取自账本写入时刻"
 
     # 收盘后延迟一直涨，没有意义，只报事实不告警
     if not _in_session():
