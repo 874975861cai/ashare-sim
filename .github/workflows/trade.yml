@@ -1,0 +1,106 @@
+name: A股模拟盘 · 云端执行
+
+# 为什么能白嫖：这套程序是「确定性重放」——每次运行都把账本恢复成当日开盘
+# 状态，再用当日分时从 09:30 重演到现在。所以定时器不需要精准，也不需要
+# 保活一个常驻进程。跑一次就补齐全天，跑十次结果也一样。
+#
+# GitHub 的 cron 只有 5 分钟粒度，实测还经常延迟 5-20 分钟。对本策略无害：
+# 延迟只影响「手机上看到得晚」，成交价和成交时刻都取自分时里的分钟戳。
+
+on:
+  schedule:
+    # UTC。北京时间 = UTC+8
+    #   09:30-11:35 → 01:30-03:35
+    #   13:00-15:30 → 05:00-07:30
+    - cron: "*/5 1-3,5-7 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "跳过交易时段判断（人工补跑）"
+        type: boolean
+        default: true
+
+# 必须串行：两个 job 同时写 state/ 会丢流水，账本就直接错了。
+concurrency:
+  group: ashare-sim-ledger
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  trade:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # 纯标准库，没有任何 pip 依赖 —— 这是刻意保持的，云上少一层故障面。
+      - name: 核对依赖仍为零
+        run: |
+          python - <<'PY'
+          import re, pathlib, sys
+          mods = set()
+          for p in pathlib.Path("engine").glob("*.py"):
+              for line in p.read_text(encoding="utf-8").splitlines():
+                  m = re.match(r"(?:import|from)\s+([a-zA-Z_][\w.]*)", line)
+                  if m:
+                      mods.add(m.group(1).split(".")[0])
+          local = {p.stem for p in pathlib.Path("engine").glob("*.py")}
+          std = set(sys.stdlib_module_names)
+          third = mods - std - local
+          print("疑似第三方依赖:", sorted(third) or "无")
+          sys.exit(1 if third else 0)
+          PY
+
+      - name: 执行一轮
+        env:
+          TZ: Asia/Shanghai
+          SIM_CLOUD_URL: https://ashare-sim-dashboard.app.workbuddy.host
+          SIM_SYNC_TOKEN: ${{ secrets.SIM_SYNC_TOKEN }}
+        run: |
+          set +e
+          python engine/cloud_run.py ${{ inputs.force && '--force' || '' }}
+          code=$?
+          set -e
+          # 退出码 2 = 非交易时段 / 非交易日，属于正常跳过，不是失败
+          if [ "$code" -eq 2 ]; then
+            echo "::notice title=跳过::本轮不在交易窗口，正常退出"
+            exit 0
+          fi
+          exit "$code"
+
+      - name: 账本入库存档
+        run: |
+          set -e
+          git config user.name  "ashare-sim-bot"
+          git config user.email "bot@users.noreply.github.com"
+
+          # 只提交「账本真相」。净值表盘中每 5 分钟都会随行情变动，
+          # 若照单全收，一天就是 60 多次提交，历史会被噪音淹掉。
+          # 规则：有新成交就提交；没有新成交，则只在收盘后提交一次。
+          new_trade=0
+          git diff --quiet -- state/trades.csv state/account.json || new_trade=1
+
+          after_close=$(python -c "from datetime import datetime,timezone,timedelta as d;print(1 if datetime.now(timezone(d(hours=8))).strftime('%H:%M')>'15:00' else 0)")
+
+          if [ "$new_trade" -eq 0 ] && [ "$after_close" -eq 0 ]; then
+            echo "盘中无新成交，跳过提交"
+            exit 0
+          fi
+
+          git add -A state
+          if git diff --cached --quiet; then
+            echo "暂存区无变化"
+            exit 0
+          fi
+          git commit -m "chore(ledger): $(TZ=Asia/Shanghai date +'%Y-%m-%d %H:%M') 收盘存档"
+          git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || true
+          git push

@@ -1,0 +1,35 @@
+# ---- 不要进版本库的东西 ----
+# 行情缓存：每次运行都会重建，5.9MB，进库几分钟就涨一截
+state/cache/
+
+# 运行期痕迹：进程号、日志、临时锁
+*.log
+*.pid
+state/loop.pid
+state/serve.pid
+
+# 同步幂等标记：纯本机状态，云端自己会重新生成
+state/.pushed
+state/.published
+
+# 健康检查与心跳：每次都变，进库会把提交历史刷满，而且没有审计价值
+state/doctor.json
+state/heartbeat.json
+
+# 生成的看板 HTML（1.2MB，每次跑都重写，且含大量行情快照）
+dashboard/
+
+# 本机便捷脚本、WorkBuddy 项目数据
+*.bat
+*.genie
+.workbuddy/
+
+# 个人交易日志：留在本地，不往公开仓库放
+journal/
+
+# 备份目录
+state/backup_*/
+
+# Python
+__pycache__/
+*.pyc
