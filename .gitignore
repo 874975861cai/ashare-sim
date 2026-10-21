@@ -27,6 +27,10 @@ dashboard/
 # 个人交易日志：留在本地，不往公开仓库放
 journal/
 
+# 凭据：绝对不能进版本库（.gh_token* 覆盖 .gh_token 与 .gh_token.txt 两种写法）
+.gh_token*
+.env
+
 # 备份目录
 state/backup_*/
 
