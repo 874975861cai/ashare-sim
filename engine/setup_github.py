@@ -146,6 +146,51 @@ def status(tok, login, watch=False):
     return runs[0]
 
 
+def logs(tok, login, keyword=""):
+    """把最近一次运行的日志打出来。
+
+    注意：GitHub 的日志下载会 302 到另一个域（Azure Blob），
+    顺手把 Authorization 带过去会被拒成 401，所以要先拿 Location 再裸取。
+    """
+    st, d = api("/repos/%s/%s/actions/runs?per_page=1" % (login, REPO_NAME), tok=tok)
+    if st != 200 or not d.get("workflow_runs"):
+        die("没有运行记录")
+    rid = d["workflow_runs"][0]["id"]
+    st, j = api("/repos/%s/%s/actions/runs/%d/jobs" % (login, REPO_NAME, rid), tok=tok)
+    jid = (j.get("jobs") or [{}])[0].get("id")
+    if not jid:
+        die("没有 job 记录")
+
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *a, **k):
+            return None
+
+    url = "%s/repos/%s/%s/actions/jobs/%d/logs" % (API, login, REPO_NAME, jid)
+    req = urllib.request.Request(url, headers={
+        "Authorization": "Bearer %s" % tok, "User-Agent": "ashare-sim-setup",
+        "Accept": "application/vnd.github+json"})
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect)
+    try:
+        opener.open(req, timeout=30)
+        die("日志接口没有重定向，行为异常")
+    except urllib.error.HTTPError as e:
+        loc = e.headers.get("Location")
+        if not loc:
+            die("取日志失败 %s" % e.code)
+    raw = urllib.request.build_opener(
+        urllib.request.ProxyHandler({})).open(loc, timeout=45).read().decode("utf-8", "replace")
+
+    for line in raw.splitlines():
+        # 行格式：2026-10-21T03:33:08.4669464Z <内容>
+        body = line.split("Z ", 1)[1] if "Z " in line else line
+        if keyword and keyword not in body:
+            continue
+        # 跳过 runner 自己的噪音，只看脚本输出
+        if body.startswith("[command]") or "Checking out the ref" in body:
+            continue
+        print("  " + body)
+
+
 def main(argv):
     tok = token()
     st, me = api("/user", tok=tok)
@@ -156,6 +201,12 @@ def main(argv):
 
     if "--status" in argv:
         status(tok, login)
+        return 0
+
+    if "--logs" in argv:
+        i = argv.index("--logs")
+        kw = argv[i + 1] if len(argv) > i + 1 else ""
+        logs(tok, login, kw)
         return 0
 
     html = ensure_repo(tok, login)
