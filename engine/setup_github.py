@@ -209,6 +209,14 @@ def main(argv):
         logs(tok, login, kw)
         return 0
 
+    # 只触发云端跑一轮，不建库、不推送、不改任何东西。
+    # 用途：GitHub 自带的 schedule 对新仓库不可靠（实测 0 触发），
+    # 由一个外部定时器调这个命令，就等于绕开调度队列，直接派活。
+    if "--trigger" in argv:
+        trigger(tok, login)
+        print("  已触发，云端约 20-60 秒后开始执行")
+        return 0
+
     html = ensure_repo(tok, login)
     push(tok, login)
     if "--push-only" not in argv:
