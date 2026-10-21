@@ -19,9 +19,11 @@ on:
   workflow_dispatch:
     inputs:
       force:
-        description: "跳过交易时段判断（人工补跑）"
+        description: "跳过交易时段判断（仅人工补跑用；外部定时器请传 false）"
         type: boolean
-        default: true
+        # 默认 false：外部定时器是「代替 cron 的自动派工」，必须走正常时段判断。
+        # 设成 true 会让凌晨也在跑，虽然是安全的（交易日守卫会拦），但纯属浪费。
+        default: false
 
 # 必须串行：两个 job 同时写 state/ 会丢流水，账本就直接错了。
 concurrency:
@@ -78,7 +80,15 @@ jobs:
           SIM_SYNC_TOKEN: ${{ secrets.SIM_SYNC_TOKEN }}
         run: |
           set +e
-          python engine/cloud_run.py ${{ inputs.force && '--force' || '' }}
+          # 用字符串比较，不用 `${{ inputs.force && '--force' || '' }}`：
+          # 外部定时器通过 API 派工时，布尔 input 常被序列化成字符串 "false"，
+          # 在表达式里是 truthy，会误加 --force 把时段判断整个跳过。
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.force }}" = "true" ]; then
+            echo "人工补跑：跳过时段判断"
+            python engine/cloud_run.py --force
+          else
+            python engine/cloud_run.py
+          fi
           code=$?
           set -e
           # 退出码 2 = 非交易时段 / 非交易日，属于正常跳过，不是失败
