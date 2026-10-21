@@ -1,0 +1,10 @@
+# 账本是逐字节比对的数据文件，禁止 git 做换行符转换。
+#
+# 起因（2026-10-21 实测）：Windows 侧 core.autocrlf=true，本地提交时把 CRLF
+# 转成 LF 入库；云端 runner 没有 autocrlf，csv.writer 写出 CRLF 也原样入库。
+# 于是同一天、同一笔流水，两边 blob 哈希永远不等 —— 云端每次运行都判定
+# 「账本有变化」并提交一次，一天 66 次全是噪音，而且真正的新成交会被淹掉。
+#
+# `-text` 表示彻底关闭该文件的换行符归一化，两边都按原始字节存取。
+state/*.csv  -text
+state/*.json -text
