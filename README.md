@@ -258,7 +258,7 @@ runner 尾盘强平也受 `can_sell` 约束；卖不掉时记一条 `LOCKED` 事
 ## 云端看板（手机 / 平板）
 
 ```
-https://ashare-sim-dashboard.app.workbuddy.host/
+https://ashare-sim-dashboard.app.workbuddy.link/
 ```
 
 打开网址就能看，不需要电脑开机、不需要装任何东西。手机浏览器直接可用。

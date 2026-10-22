@@ -250,6 +250,53 @@ def t_t1_etf():
             check(False, "当日买入的股票型 ETF 竟然卖掉了（T+1 校验失效）")
 
 
+@case("券商：0 股 / 负股数卖出必须被拒")
+def t_sell_invalid_shares():
+    """0 股卖出曾经能过：0 > avail 不成立，一路走到收 5 元佣金下限，
+    账本多一笔「SELL 0 股 / 现金 -5.00」；负股数更糟，现金直接变少。
+    两者都不报错，只有对账时才会发现现金对不上。"""
+    with sandbox():
+        acc = broker.load_account()
+        dt = datetime(2026, 10, 19, 10, 0)
+        broker.buy(acc, "510300", "a", 4.0, 1000, dt)
+        cash = broker.load_account()["cash"]
+        for bad in (0, -100):
+            try:
+                broker.sell(acc, "510300", "a", 4.0, bad, dt)
+            except broker.Reject:
+                pass
+            else:
+                raise AssertionError("%d 股卖出竟然成交" % bad)
+        check(broker.load_account()["cash"] == cash,
+              "被拒的卖出动过现金：%.2f → %.2f"
+              % (cash, broker.load_account()["cash"]))
+
+
+@case("分时：盘后 tick（15:05+）必须裁掉")
+def t_trim_afterhours():
+    """东财 ETF 分时含 15:05-15:30 的盘后固定价格成交（实测 2026-10-22
+    588000/510300/159915 三只最后一根都落在 15:30）。
+
+    危害路径：时间轴取全池并集，tlist[-1] 变成 15:30；一旦某个持仓标的
+    尾盘缺数据，兜底强平就拿 15:30 去下单，broker 判「非连续竞价时段」
+    拒单 —— 仓位安静过夜，账本里只留一条 REJECT。盘后价不属于交易时段，
+    必须在进模型之前裁掉，而不是指望撮合层兜。
+    """
+    raw = [{"t": "2026-10-22 09:30", "price": 4.0},
+           {"t": "2026-10-22 11:30", "price": 4.0},
+           {"t": "2026-10-22 12:00", "price": 4.0},     # 午休
+           {"t": "2026-10-22 14:49", "price": 4.0},
+           {"t": "2026-10-22 15:00", "price": 4.0},
+           {"t": "2026-10-22 15:06", "price": 4.0},     # 盘后定价
+           {"t": "2026-10-22 15:30", "price": 4.0}]
+    kept = [t["t"][11:] for t in runner._trim_to_session(raw)]
+    check(kept == ["09:30", "11:30", "14:49", "15:00"],
+          "盘后/午休 tick 没裁干净：%s" % kept)
+    # 15:30 本来就撮合不了——这条断言锁住「为什么必须裁」而不是「裁了好看」
+    check(not broker.in_trading_session(datetime(2026, 10, 22, 15, 30)),
+          "15:30 竟然算连续竞价时段")
+
+
 @case("分时：接口返回 0 根不能当成功")
 def t_empty_trends():
     """2026-10-20 自审抓到的静默兜底。
@@ -277,6 +324,23 @@ def t_empty_trends():
         market._get = old_get
         market.CACHE_DIR = old_dir
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+@case("云端：账本写入但推送失败 → 退出码 4")
+def t_cloud_push_fail():
+    """账本对了、看板没更新，是最容易漏掉的一种状态：workflow 全绿、
+    日志里只有一行 print。2026-10-22 的 SIM_CLOUD_URL 指向已下线域名
+    就是这样一轮都没推出去。这条用例把「必须能看见」钉死。"""
+    import cloud_run
+    old_run, old_push, old_build = runner.run, runner.LAST_PUSH, cloud_run.dashboard.build
+    try:
+        runner.run = lambda **k: {"snapshot": {}, "events": [], "pool": [], "acc": {}}
+        runner.LAST_PUSH = ("fail", "URLError: tunnel")
+        cloud_run.dashboard.build = lambda quiet=False: "/tmp/x.html"
+        code = cloud_run.main(["--force"])
+    finally:
+        runner.run, runner.LAST_PUSH, cloud_run.dashboard.build = old_run, old_push, old_build
+    check(code == 4, "推送失败时退出码应为 4，实际 %s" % code)
 
 
 @case("成交后资金恒等式成立")

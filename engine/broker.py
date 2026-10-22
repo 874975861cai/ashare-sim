@@ -8,7 +8,9 @@
 2. 涨跌停：主板 ±10%，创业板/科创板 ±20%，ST ±5%，北交所 ±30%；
    买卖价格不得超出当日涨跌停价。
 3. 最小交易单位：买入 100 股/份的整数倍；卖出可全部卖出（含零股）。
-4. 交易时段：9:30-11:30、13:00-15:00；集合竞价 9:15-9:25、14:57-15:00 不撮合。
+4. 交易时段：9:30-11:30、13:00-15:00。开盘集合竞价 9:15-9:25 不撮合；
+   14:57-15:00 的收盘集合竞价**故意放行**：那段没有独立撮合，但分时最后一根
+   常落在 14:57-15:00，尾盘强平必须能用它成交，否则仓位会安静地过夜。
 5. 费用：佣金万 2.5（最低 5 元，双边）；印花税 0.05%（仅卖出、仅股票）；
    过户费 0.001%（仅股票、双边）。ETF 免印花税、免过户费。
 6. 滑点：按最小价格变动单位撮合（买入 +1 tick / 卖出 -1 tick），
@@ -16,6 +18,7 @@
 7. 资金：卖出资金当日可用（A 股实际规则），不可提现。
 """
 import csv
+import io
 import json
 import os
 from datetime import datetime
@@ -63,6 +66,26 @@ def round_price(code, p):
     return round(round(float(p) / t) * t, 3 if t == 0.001 else 2)
 
 
+# 跟踪创业板/科创板指数的 ETF，涨跌幅限制是 20%，不是 10%。
+# 依据：上交所《科创板相关基金》页面「科创板相关基金的涨跌幅比例为 20%」；
+# 深交所投教《ETF 投资问答》第 32 期「跟踪指数成份股为创业板/科创板股票的
+# ETF 涨跌幅限制也为 20%」。池子里的 159915（创业板ETF）与 588xxx（科创50）
+# 都在此列，按 10% 判会在大涨日把真实可成交的单子拒掉，还报「高于涨停价」。
+#
+# 不能按 159/588 前缀一刀切：159919 沪深300ETF、159901 深100ETF 都是 10%。
+# 所以用「代码名单 + 名称关键词」两个判据，两者都不命中就按 10%（保守）。
+LIMIT20_ETF = frozenset({"159915", "159949", "159952", "159958", "159977",
+                         "588000", "588080"})
+LIMIT20_WORDS = ("创业板", "科创", "双创", "创50", "创成长")
+
+
+def _is_20pct_etf(code, name=""):
+    if str(code) in LIMIT20_ETF:
+        return True
+    nm = str(name or "")
+    return any(w in nm for w in LIMIT20_WORDS)
+
+
 def limit_ratio(code, name=""):
     """涨跌幅限制比例。"""
     code = str(code)
@@ -72,6 +95,8 @@ def limit_ratio(code, name=""):
         return 0.20
     if code.startswith(("8", "4", "92")):      # 北交所
         return 0.30
+    if is_etf(code) and _is_20pct_etf(code, name):
+        return 0.20
     return 0.10
 
 
@@ -115,6 +140,22 @@ def _ensure_files():
         })
 
 
+def _atomic_write_text(path, text, encoding="utf-8", newline=None):
+    """先写临时文件再 os.replace：不让「写一半」变成永久损坏。
+
+    云端 runner 会被 timeout-minutes / concurrency 取消，进程随时可能在
+    写文件中间被杀。直接 "w" 打开目标文件的话，账本会停在被截断的半截 JSON 上，
+    下一轮 load_account() 抛 JSONDecodeError —— 一次取消换来整个账本打不开。
+    os.replace 在同一分区上是原子的，最坏情况是「这轮没写进去」，不是「写坏」。
+    """
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding=encoding, newline=newline) as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
 def load_account():
     _ensure_files()
     with open(ACCOUNT_FILE, "r", encoding="utf-8") as f:
@@ -123,8 +164,8 @@ def load_account():
 
 def save_account(acc):
     os.makedirs(STATE, exist_ok=True)
-    with open(ACCOUNT_FILE, "w", encoding="utf-8") as f:
-        json.dump(acc, f, ensure_ascii=False, indent=2)
+    _atomic_write_text(ACCOUNT_FILE,
+                       json.dumps(acc, ensure_ascii=False, indent=2))
 
 
 def roll_day(acc, day):
@@ -176,15 +217,28 @@ def is_t0_etf(code):
     return c == "159920"
 
 
+def _lot_sellable(lot, today, code):
+    """这一批份额在今天能不能卖。
+
+    T+0 品种（债券/黄金/跨境/货币 ETF）全天可卖；其余只有今天之前买入的可卖。
+    这个判据只能有一处：`available_shares` 用它算「能卖多少」，`sell` 的 FIFO
+    核销也要用它决定跳过哪些批次。原来两处各写一套判据（一处看日期，一处看
+    `is_stock`），股票型 ETF 在核销环节被当成「今天也能卖」——一旦哪天
+    「可卖数量」与「核销批次」对不上，就会拿今天的份额去抵昨天的卖出，
+    盈亏算出来的数是错的，而且不报错。
+    """
+    if is_etf(code) and is_t0_etf(code):
+        return True
+    return str(lot.get("date", "")) < today
+
+
 def available_shares(pos, today, code):
     """可卖数量。
 
     股票，以及股票型 ETF：只有昨日及更早买入的份额可卖（T+1）。
     债券/黄金/跨境/货币 ETF：全部可卖（T+0）。
     """
-    if is_etf(code) and is_t0_etf(code):
-        return sum(l["shares"] for l in pos["lots"])
-    return sum(l["shares"] for l in pos["lots"] if l["date"] < today)
+    return sum(l["shares"] for l in pos["lots"] if _lot_sellable(l, today, code))
 
 
 def position_shares(pos):
@@ -200,12 +254,27 @@ def avg_cost(pos):
     return (cost + fees) / s
 
 
-def market_value(acc, quotes):
+def market_value_detail(acc, quotes):
+    """返回 (市值, 无行情的标的列表)。
+
+    无行情时按成本估值是有意的兜底（停牌时总得有个数），但**必须能看见**：
+    原来直接 `or avg_cost(pos)`，报价缺失和「价格没变」长得一模一样，
+    净值会一整天纹丝不动，看起来像"行情没波动"，实际是没数据。
+    所以把"哪些标的没吃到报价"显式返回，由调用方去告警。
+    """
     mv = 0.0
+    unpriced = []
     for code, pos in acc["positions"].items():
-        px = (quotes.get(code) or {}).get("price") or avg_cost(pos)
+        px = (quotes.get(code) or {}).get("price")
+        if not px:
+            px = avg_cost(pos)
+            unpriced.append(code)
         mv += position_shares(pos) * px
-    return round(mv, 2)
+    return round(mv, 2), unpriced
+
+
+def market_value(acc, quotes):
+    return market_value_detail(acc, quotes)[0]
 
 
 def equity_of(acc, quotes):
@@ -231,11 +300,18 @@ def buy(acc, code, name, price, shares, dt, reason="", preclose=None):
     if code not in acc["positions"] and len(acc["positions"]) >= MAX_POSITIONS:
         raise Reject(f"持仓上限 {MAX_POSITIONS} 只，当前已持有 "
                      f"{'、'.join(acc['positions'])}")
+    if price <= 0:
+        raise Reject("报价无效（%s），不能按 0 元成交" % price)
+    up = None
     if preclose:
         up, _ = limit_prices(code, preclose, name)
         if price > up + 1e-9:
             raise Reject(f"价格 {price} 高于涨停价 {up}，无法成交")
     px = round_price(code, price + price_tick(code))    # 买方吃一档
+    if up is not None and px > up + 1e-9:
+        # 封在涨停上时买方吃不到货：再加一档滑点就超出涨停价，现实中不可能成交。
+        # 原来只校验报价、不校验加滑点后的成交价，会记出 2.896 买入涨停 2.895 的假成交。
+        raise Reject(f"涨停封板：报价 {price} 吃一档后 {px} 超过涨停价 {up}，无法成交")
     amount = round(px * shares, 2)
     fee = calc_fee(code, "BUY", amount, name)
     need = amount + fee["total"]
@@ -260,25 +336,41 @@ def sell(acc, code, name, price, shares, dt, reason="", preclose=None):
     code = str(code)
     if not in_trading_session(dt):
         raise Reject("非连续竞价时段")
+    # 0 股和负股数必须挡在门外。原来没有这道门，后果是安静的：
+    # shares=0 时 0 > avail 不成立，一路走到 calc_fee，佣金按下限收 5 元，
+    # 于是账本里多出一笔「SELL 0 股 / net_cash -5.00」，现金白掉 5 块；
+    # shares=-100 更糟，amount 变负数、现金直接减少，还记了一笔负股数成交。
+    # 两者都不报错，只有对账时才会看到现金对不上。
+    if not isinstance(shares, int) or shares <= 0:
+        raise Reject(f"卖出数量必须为正整数，当前 {shares!r}")
     pos = acc["positions"].get(code)
     if not pos:
         raise Reject("无持仓")
     total = position_shares(pos)
     avail = available_shares(pos, dt.strftime("%Y-%m-%d"), code)
+    if avail <= 0:
+        raise Reject(f"T+1 限制：今日买入的份额不可卖出，可卖 0，请求 {shares}")
     if shares > avail:
         raise Reject(f"T+1 限制：可卖 {avail} 份/股，请求 {shares}")
     if shares < total and shares % 100 != 0:
         raise Reject("部分卖出须为100整数倍")
+    if price <= 0:
+        raise Reject("报价无效（%s），不能按 0 元成交" % price)
+    down = None
     if preclose:
         _, down = limit_prices(code, preclose, name or pos["name"])
         if price < down - 1e-9:
             raise Reject(f"价格 {price} 低于跌停价 {down}，无法成交")
     px = round_price(code, price - price_tick(code))    # 卖方让一档
+    if down is not None and px < down - 1e-9:
+        # 跌停封板同理：再让一档就跌破跌停价，这种成交价不存在。
+        raise Reject(f"跌停封板：报价 {price} 让一档后 {px} 低于跌停价 {down}，无法成交")
     amount = round(px * shares, 2)
     fee = calc_fee(code, "SELL", amount, pos["name"])
     proceeds = round(amount - fee["total"], 2)
 
     # 按先进先出核销批次，计算已实现盈亏
+    today = dt.strftime("%Y-%m-%d")
     cost_basis = 0.0
     left = shares
     new_lots = []
@@ -286,7 +378,7 @@ def sell(acc, code, name, price, shares, dt, reason="", preclose=None):
         if left <= 0:
             new_lots.append(lot)
             continue
-        if lot["date"] == dt.strftime("%Y-%m-%d") and is_stock(code):
+        if not _lot_sellable(lot, today, code):
             new_lots.append(lot)
             continue
         take = min(lot["shares"], left)
@@ -297,6 +389,11 @@ def sell(acc, code, name, price, shares, dt, reason="", preclose=None):
         if take < lot["shares"]:
             new_lots.append({**lot, "shares": lot["shares"] - take,
                              "fee": round(lot.get("fee", 0) - unit_fee, 2)})
+    if left > 0:
+        # 走到这里说明「可卖数量」和「能核销的批次」对不上（状态被改坏、
+        # 或者两个判据又分叉了）。绝不能继续：那样 cost_basis 会少算，
+        # pnl 变成凭空多出来的利润，而且账本照样写下去。
+        raise Reject(f"可卖份额不足：请求 {shares}，核销后仍差 {left}，拒绝成交")
     pos["lots"] = new_lots
     pnl = round(amount - cost_basis, 2)
     pos["realized"] = round(pos.get("realized", 0) + pnl, 2)
@@ -332,7 +429,7 @@ def snapshot(acc, quotes, note="", write=True):
     那一行上；dry 模式不 roll_day，那个日期还是昨天，等于用今天的数
     覆盖昨天的历史净值。
     """
-    mv = market_value(acc, quotes)
+    mv, unpriced = market_value_detail(acc, quotes)
     eq = round(acc["cash"] + mv, 2)
     init = acc["meta"]["init_capital"]
     rows = []
@@ -350,10 +447,13 @@ def snapshot(acc, quotes, note="", write=True):
                  f"{day_pnl:.2f}", f"{round(eq - init, 2):.2f}", note])
     body.sort(key=lambda x: x[0])
     if write:
-        with open(EQUITY_FILE, "w", newline="", encoding="utf-8-sig") as f:
-            w = csv.writer(f)
-            w.writerow(["date", "equity", "cash", "market_value",
-                        "day_pnl", "total_pnl", "note"])
-            w.writerows(body)
+        buf = io.StringIO(newline="")
+        w = csv.writer(buf)
+        w.writerow(["date", "equity", "cash", "market_value",
+                    "day_pnl", "total_pnl", "note"])
+        w.writerows(body)
+        _atomic_write_text(EQUITY_FILE, buf.getvalue(),
+                           encoding="utf-8-sig", newline="")
     return {"equity": eq, "cash": acc["cash"], "market_value": mv,
-            "day_pnl": day_pnl, "total_pnl": round(eq - init, 2)}
+            "day_pnl": day_pnl, "total_pnl": round(eq - init, 2),
+            "unpriced": unpriced}

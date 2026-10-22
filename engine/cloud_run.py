@@ -18,6 +18,7 @@
     0 = 已执行
     2 = 不在交易时段 / 非交易日，正常跳过（不是错误）
     3 = 在窗口内但拿不到行情（无标的 / 无分时），这是故障，不是跳过
+    4 = 账本已写入，但推送到云端看板失败（看板会停在旧账本）
     1 = 执行出错
 """
 import json
@@ -95,6 +96,15 @@ def main(argv):
     except Exception as e:  # noqa: BLE001
         # 看板挂了不能影响账本，账本才是唯一的真相
         print("看板生成失败（不影响账本）: %s: %s" % (type(e).__name__, e))
+
+    # 「账本写进去了」和「手机上看得到」是两件事。
+    # 推送失败时账本是对的、workflow 是绿的、日志里只有一行 print，
+    # 于是看板能安静地停更好几天（2026-10-22 就是：workflow 里的
+    # SIM_CLOUD_URL 还指着已经下线的旧域名，一轮都没推出去，没人发现）。
+    pst, pmsg = getattr(runner, "LAST_PUSH", ("", ""))
+    if pst == "fail":
+        print("账本已写入，但推送到看板失败：%s" % pmsg)
+        return 4
 
     print("云端执行完成。")
     return 0

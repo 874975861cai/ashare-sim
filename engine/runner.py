@@ -28,6 +28,10 @@ OPEN_FILE = os.path.join(STATE, "account_open.json")
 # not_trading_day / no_data / no_pool —— 三种「返回 None」的原因不能混为一谈。
 LAST_SKIP = ""
 
+# 上一次账本推送的结果 (status, msg)。账本写成功、但看板没更新，是第三种
+# 状态：既不是「跑完了」，也不是「跳过了」。混在一起就没人会发现看板停更。
+LAST_PUSH = ("", "")
+
 
 # --------------------------------------------------------------------------
 def reset_to_open(day):
@@ -124,9 +128,32 @@ def _warn_overnight(acc, day, verbose=True):
     return stale
 
 
+def _trim_to_session(ticks):
+    """只保留连续竞价时段（09:30-11:30 / 13:00-15:00）的分钟。
+
+    东财的 ETF 分时会把 15:05-15:30 的盘后固定价格成交一并吐出来——实测
+    2026-10-22 的 588000 / 510300 / 159915 三只，最后一根都落在 15:30。
+    照单全收的后果不是报错，是安静地做错事：
+      * tlist[-1] 变成 15:30，尾盘兜底强平拿 15:30 去下单，broker 判「非连续
+        竞价时段」拒单，仓位过夜，账本里只留一条 REJECT；
+      * 循环里 15:06-15:30 每分钟再试一次，攒出一串没用的 REJECT。
+    盘后成交价不属于我们的交易时段，一律丢弃。
+    """
+    out = []
+    for t in ticks:
+        ts = t.get("t") or ""
+        if len(ts) < 16:
+            continue
+        hm = int(ts[11:13]) * 100 + int(ts[14:16])
+        if (930 <= hm <= 1130) or (1300 <= hm <= 1500):
+            out.append(t)
+    return out
+
+
 def run(verbose=True, params=None, execute=True, ttl=600):
-    global LAST_SKIP
+    global LAST_SKIP, LAST_PUSH
     LAST_SKIP = ""
+    LAST_PUSH = ("", "")
     params = params or dict(strategy.PARAMS)
     acc = broker.load_account()
     now = datetime.now()
@@ -149,8 +176,9 @@ def run(verbose=True, params=None, execute=True, ttl=600):
     for p in pool:
         try:
             tr = market.fetch_trends(p["code"], ndays=1, ttl=ttl)
-            if tr["ticks"]:
-                data[p["code"]] = tr
+            ticks = _trim_to_session(tr.get("ticks") or [])
+            if ticks:
+                data[p["code"]] = {**tr, "ticks": ticks}
         except Exception as e:  # noqa: BLE001
             if verbose:
                 print(f"  ! {p['code']} 分时拉取失败: {e}")
@@ -331,6 +359,10 @@ def run(verbose=True, params=None, execute=True, ttl=600):
     snap = broker.snapshot(acc, quotes, note="盘中运行", write=execute)
     if execute:
         _heartbeat(day, snap, events)
+    # 无行情=按成本估值，净值会「静止」。这不是行情没波动，是没数据。
+    if snap.get("unpriced"):
+        print("  [警告] 无报价、按成本估值：%s（净值可能静止，不等于没波动）"
+              % "、".join(snap["unpriced"]))
 
     if verbose:
         print("=" * 62)
@@ -379,11 +411,13 @@ def run(verbose=True, params=None, execute=True, ttl=600):
             try:
                 import push_cloud
                 st, msg = push_cloud.push()
+                LAST_PUSH = (st, msg)
                 if st == "fail" and verbose:
                     # 推送失败不影响账本，但必须说出来：否则线上看板会一直停在
                     # 旧账本，而每轮 workflow 都是绿的，没人会发现。
                     print("  [警告] 账本推送到云端失败：%s" % msg)
             except Exception as e:  # noqa: BLE001
+                LAST_PUSH = ("fail", "%s: %s" % (type(e).__name__, e))
                 if verbose:
                     print("  [警告] 推送异常：%s: %s" % (type(e).__name__, e))
         elif verbose:

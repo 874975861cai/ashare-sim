@@ -29,6 +29,11 @@ import broker      # noqa: E402
 URL = (os.environ.get("SIM_CLOUD_URL")
        or "https://ashare-sim-dashboard.app.workbuddy.link").rstrip("/")
 TOKEN = os.environ.get("SIM_SYNC_TOKEN") or "sim-sync-9f3a7c"
+# ⚠️ 上面这个兜底 token 写在公开仓库里，等于一把人人可用的钥匙：谁都能拿它
+# POST /api/sync 覆盖线上账本。保留它只是为了「secret 没配时不至于当场停服」，
+# 但从现在起每次走到兜底都要留痕，否则连「线上账本被谁写的」都查不出来。
+# 真正的修法是轮换 Worker 侧与 GitHub secret 里的同一把 token，那一步要人来定。
+_ENV_TOKEN = os.environ.get("SIM_SYNC_TOKEN") or ""
 
 SIG_FILE = os.path.join(broker.STATE, ".pushed")
 PUB_FILE = os.path.join(broker.STATE, ".published")
@@ -84,6 +89,11 @@ def _log(line):
 
 def push(force=False, timeout=8, verbose=False):
     """返回 (状态, 说明)。状态是 pushed / skip / fail，任何情况都不抛异常。"""
+    if not _ENV_TOKEN:
+        # 只在「真的用了硬编码兜底」时喊一声，避免每轮都刷
+        _log("warn 使用硬编码兜底 token（SIM_SYNC_TOKEN 未设置）")
+        if verbose:
+            print("  [警告] SIM_SYNC_TOKEN 未设置，本轮用的是硬编码兜底 token")
     sig = _sig()
     if not sig:
         return "fail", "账本读不出来"
