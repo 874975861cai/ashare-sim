@@ -27,7 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import broker      # noqa: E402
 
 URL = (os.environ.get("SIM_CLOUD_URL")
-       or "https://ashare-sim-dashboard.app.workbuddy.host").rstrip("/")
+       or "https://ashare-sim-dashboard.app.workbuddy.link").rstrip("/")
 TOKEN = os.environ.get("SIM_SYNC_TOKEN") or "sim-sync-9f3a7c"
 
 SIG_FILE = os.path.join(broker.STATE, ".pushed")
