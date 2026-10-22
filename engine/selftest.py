@@ -52,6 +52,23 @@ def check(cond, msg):
         raise AssertionError(msg)
 
 
+def today():
+    """测试行情必须造在「今天」。
+
+    runner 里有一道交易日守卫：分时里所有 tick 的日期都不等于今天，就认定
+    「非交易日/还没开盘」直接退出。用例若把日期写死成某一天，过了那天，
+    守卫会把整条链路拦在账本之前——于是幂等、过夜仓、尾盘强平三条用例
+    全部因为「拿到的是 2026-10-19 的分时」而红，看起来像三个 bug，
+    其实是一个：测的不是代码，是日历。2026-10-22 就是这么红的。
+    """
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def days_before(n):
+    """n 天前的日期，用于造「前一日建仓」的过夜仓。"""
+    return datetime.fromtimestamp(datetime.now().timestamp() - n * 86400).strftime("%Y-%m-%d")
+
+
 # --------------------------------------------------------------------------
 # 临时 state 沙箱
 # --------------------------------------------------------------------------
@@ -297,7 +314,7 @@ def t_snapshot_nowrite():
 def t_dry_no_side_effect():
     with sandbox():
         broker.load_account()
-        day = "2026-10-19"
+        day = today()
         px = flat_prices(242, 4.0, -0.02)
         ticks = mk_ticks(day, px)
         q = {"510300": mk_quote("510300", px[-1])}
@@ -320,7 +337,7 @@ def t_dry_no_side_effect():
 def t_idempotent():
     with sandbox():
         broker.load_account()
-        day = "2026-10-19"
+        day = today()
         n = len(session_minutes())
         # 早盘下跌制造偏离，中段反弹触发买入，尾盘拉升触发止盈
         px = []
@@ -352,8 +369,8 @@ def t_idempotent():
 def t_overnight():
     with sandbox():
         acc = broker.load_account()
-        seed_position(acc, "510300", 1000, 4.0, "2026-10-16")
-        day = "2026-10-19"
+        seed_position(acc, "510300", 1000, 4.0, days_before(7))
+        day = today()
         n = len(session_minutes())
         px = flat_prices(n, 4.0, -0.05)          # 一路阴跌，制造买入诱惑
         ticks = mk_ticks(day, px)
@@ -376,8 +393,8 @@ def t_overnight():
 def t_missing_tail():
     with sandbox():
         acc = broker.load_account()
-        seed_position(acc, "510300", 1000, 4.0, "2026-10-16")
-        day = "2026-10-19"
+        seed_position(acc, "510300", 1000, 4.0, days_before(7))
+        day = today()
         mins = session_minutes()
         # 持仓标的的 tick 到 14:10 就断了；另一只正常走到 14:55
         cut = next(k for k, (h, m) in enumerate(mins) if h == 14 and m == 10)

@@ -34,6 +34,7 @@ journal/
 
 # 备份目录
 state/backup_*/
+state/_backup_*/
 
 # Python
 __pycache__/

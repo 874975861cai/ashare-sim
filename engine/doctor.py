@@ -283,24 +283,13 @@ def check_service():
         else:
             add(WARN, "运行时", "残留 pid", "进程不存在但 pid 文件还在")
 
-    # 尝试拉起
-    if DO_FIX:
-        pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
-        exe = pyw if os.path.exists(pyw) else sys.executable
-        try:
-            si = subprocess.STARTUPINFO()
-            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            subprocess.Popen([exe, os.path.join(ENGINE, "serve.py"), "--no-browser"],
-                             cwd=ROOT, startupinfo=si, close_fds=True)
-            for _ in range(25):
-                time.sleep(0.4)
-                if find_port():
-                    add(FIX, "运行时", "实时服务", "原来没跑，已自动拉起")
-                    return find_port()
-        except Exception as e:  # noqa: BLE001
-            add(WARN, "运行时", "拉起失败", str(e)[:60])
-
-    add(CRIT, "运行时", "实时服务", "不在运行，页面只能是快照。双击 打开模拟盘.bat")
+    # 不再自动拉起本地服务。
+    # 2026-10-21 起拓扑变了：账本主人是 GitHub Actions，看板由云端维护，
+    # 本地只是一份只读镜像。在这里拉起 serve.py 有三个坏处——它会占端口、
+    # 往 dashboard/ 写文件、并且让「本地没在跑」这个正常状态每轮被自动抹掉，
+    # 于是没人知道本地其实一直在空转。要开本地页面请手动双击 打开模拟盘.bat。
+    add(OK, "运行时", "实时服务",
+        "本地未运行（看板由云端维护，属正常；需要本地页面请跑 打开模拟盘.bat）")
     return None
 
 
@@ -321,7 +310,15 @@ def check_page(port):
     age = _page_age()
     # 服务在线时，页面每 30 秒会被回写一次；超过 5 分钟说明回写没生效
     limit = 300
-    if age is not None and age > limit:
+    if age is not None and age > limit and port is None:
+        # 本地服务没起时，这份页面本来就只是静态快照（看板以云端为准），
+        # 老化不是缺陷。顺手重写一份，用户偶尔双击打开时别看到太旧的数；
+        # 重写失败也不报警——这个文件不影响任何账务判断。
+        if DO_FIX:
+            _regen_page()
+        add(OK, "运行时", "页面新鲜度",
+            "静态快照（%.0f 小时前），本地服务未启用，属正常" % (age / 3600))
+    elif age is not None and age > limit:
         if DO_FIX and _regen_page():
             add(FIX, "运行时", "页面新鲜度",
                 "快照已 %.0f 分钟没更新，已重写" % (age / 60))
@@ -376,24 +373,60 @@ def _regen_page():
         return False
 
 
-def check_heartbeat():
-    hb = _read_json(os.path.join(STATE, "heartbeat.json"))
-    if not hb:
-        add(WARN, "运行时", "任务心跳", "无记录（自动化还没跑过）")
-        return
-    last = str(hb.get("last_run") or "")
+def _ledger_last_day():
+    """账本里最后一行净值是哪一天（内容信号，不受 git pull 影响）。"""
     try:
-        dt = datetime.strptime(last, "%Y-%m-%d %H:%M:%S")
-    except ValueError:
-        add(WARN, "运行时", "任务心跳", "时间格式异常 %s" % last)
+        with open(broker.EQUITY_FILE, "r", encoding="utf-8-sig", newline="") as f:
+            rows = [r for r in csv.DictReader(f) if r.get("date")]
+        return rows[-1]["date"] if rows else ""
+    except (OSError, csv.Error):
+        return ""
+
+
+def check_heartbeat():
+    """判断「自动化还在跑吗」。
+
+    有两个信号：本地 heartbeat.json 和账本里的净值行。
+    heartbeat 只有本地 runner 会写，而且被 .gitignore 排除、从不上传，
+    所以云端跑一百次也不会更新它——只盯它，会在本地停跑 40 小时后天天
+    误报「自动化被关」，而云端其实一直在记账。2026-10-21 之后拓扑变了，
+    账本才是唯一真相：净值表里有没有「今天」这一行，才是最硬的证据。
+    """
+    hb = _read_json(os.path.join(STATE, "heartbeat.json")) or {}
+    last = str(hb.get("last_run") or "")
+    hb_dt = None
+    if last:
+        try:
+            hb_dt = datetime.strptime(last, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            add(WARN, "运行时", "任务心跳", "时间格式异常 %s" % last)
+            return
+
+    now = datetime.now()
+    today = now.strftime("%Y-%m-%d")
+    led_day = _ledger_last_day()
+    note = ("；本地心跳停在 %s，本地不记账，属正常" % last) if last else ""
+
+    if led_day == today:
+        add(OK, "运行时", "任务心跳", "今日账本已写入%s" % note)
         return
-    gap = (datetime.now() - dt).total_seconds() / 3600
-    # 周末与长假不判，只看「超过 40 小时没跑过」
-    if gap > 40:
+
+    hm = now.strftime("%H:%M")
+    # 10:00 之前不判：云端 cron 有 5-20 分钟抖动，太早问等于催
+    active = now.weekday() < 5 and "10:00" <= hm <= "15:30"
+    if active:
         add(WARN, "运行时", "任务心跳",
-            "已 %.0f 小时没运行（最后 %s），检查自动化是否被关" % (gap, last))
-    else:
-        add(OK, "运行时", "任务心跳", "最后 %s" % last)
+            "盘中但今天账本还没有净值行（最后 %s），云端自动化可能没跑"
+            % (led_day or "无"))
+        return
+
+    if hb_dt is not None:
+        gap = (now - hb_dt).total_seconds() / 3600
+        if gap <= 40:
+            add(OK, "运行时", "任务心跳", "最后 %s" % last)
+            return
+    add(OK, "运行时", "任务心跳",
+        "非盘中时段，不判漏跑（账本最后净值行 %s）%s" % (led_day or "无", note))
 
 
 # ==========================================================================

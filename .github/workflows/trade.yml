@@ -96,6 +96,14 @@ jobs:
             echo "::notice title=跳过::本轮不在交易窗口，正常退出"
             exit 0
           fi
+          # 退出码 3 = 在窗口内但拉不到行情（数据源故障）。
+          # 不能跟 2 一样当"正常"——那样数据源挂一整天也不会有人知道。
+          # 也不直接 fail：一次抖动重试 5 分钟就自愈，真挂了就是每小时 12 封邮件。
+          # 折中：留一条 warning 注解，run 列表上能直接看见。
+          if [ "$code" -eq 3 ]; then
+            echo "::warning title=行情为空::交易窗口内没拿到行情，本轮未记账（数据源可能故障）"
+            exit 0
+          fi
           exit "$code"
 
       - name: 账本入库存档
@@ -122,6 +130,14 @@ jobs:
             echo "暂存区无变化"
             exit 0
           fi
-          git commit -m "chore(ledger): $(TZ=Asia/Shanghai date +'%Y-%m-%d %H:%M') 收盘存档"
+          # 提交信息要说实话：盘中成交也走这条路，全写成「收盘存档」的话，
+          # 回头翻历史根本分不清哪条是真收盘、哪条是上午的一笔成交。
+          ts=$(TZ=Asia/Shanghai date +'%Y-%m-%d %H:%M')
+          if [ "$new_trade" -eq 1 ]; then
+            msg="chore(ledger): $ts 成交记账"
+          else
+            msg="chore(ledger): $ts 收盘存档"
+          fi
+          git commit -m "$msg"
           git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || true
           git push

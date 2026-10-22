@@ -24,6 +24,10 @@ import strategy    # noqa: E402
 STATE = broker.STATE
 OPEN_FILE = os.path.join(STATE, "account_open.json")
 
+# 上一次 run() 为什么没执行（空串 = 正常跑完）。
+# not_trading_day / no_data / no_pool —— 三种「返回 None」的原因不能混为一谈。
+LAST_SKIP = ""
+
 
 # --------------------------------------------------------------------------
 def reset_to_open(day):
@@ -121,6 +125,8 @@ def _warn_overnight(acc, day, verbose=True):
 
 
 def run(verbose=True, params=None, execute=True, ttl=600):
+    global LAST_SKIP
+    LAST_SKIP = ""
     params = params or dict(strategy.PARAMS)
     acc = broker.load_account()
     now = datetime.now()
@@ -130,6 +136,11 @@ def run(verbose=True, params=None, execute=True, ttl=600):
     quotes = market.fetch_quotes(strategy.CORE_POOL)
     pool = strategy.validate_pool(quotes, params)
     if not pool:
+        # 「今天没有可交易标的」和「非交易日」是两件完全不同的事，
+        # 但对调用方都表现为 run() 返回 None。于是 cloud_run 把它们都当成
+        # 退出码 2（正常跳过），workflow 也就放着不管——接口全挂的那种日子
+        # 看起来和周末一模一样。用 LAST_SKIP 把原因带出去，别再让调用方猜。
+        LAST_SKIP = "no_pool"
         print("今日无可交易标的（流动性/价格不达标）")
         return None
 
@@ -145,6 +156,7 @@ def run(verbose=True, params=None, execute=True, ttl=600):
                 print(f"  ! {p['code']} 分时拉取失败: {e}")
 
     if not data:
+        LAST_SKIP = "no_data"
         print("无分时数据")
         return None
 
@@ -158,6 +170,7 @@ def run(verbose=True, params=None, execute=True, ttl=600):
     # 定时自动跑，节假日必然命中，所以这道守卫是上云的前置条件。
     _days = {t["t"][:10] for tr in data.values() for t in tr["ticks"] if t.get("t")}
     if day not in _days:
+        LAST_SKIP = "not_trading_day"
         print("非交易日或尚未开盘：拿到的是 %s 的分时，今天 %s"
               % ("、".join(sorted(_days)) or "无", day))
         return None
@@ -356,12 +369,25 @@ def run(verbose=True, params=None, execute=True, ttl=600):
     # 成交落地后立刻推到云端，手机端几秒内就能看到新仓位。
     # 放在最后、吞掉所有异常：同步是锦上添花，绝不能反过来把交易搞失败。
     # push_cloud 自己用流水签名做幂等，没成交时一个请求都不发。
+    #
+    # 只在云端推送。push_cloud 是 POST /api/sync「用本地三个文件覆盖线上账本」，
+    # 而 2026-10-21 起账本主人是 GitHub Actions，本地只是只读镜像——
+    # 本地镜像只要落后一天，一次跑批就会把线上已经发生的成交整段抹掉。
+    # 想在本机手动补推，显式给 SIM_PUSH=1。
     if execute:
-        try:
-            import push_cloud
-            push_cloud.push()
-        except Exception:       # noqa: BLE001
-            pass
+        if os.environ.get("GITHUB_ACTIONS") or os.environ.get("SIM_PUSH") == "1":
+            try:
+                import push_cloud
+                st, msg = push_cloud.push()
+                if st == "fail" and verbose:
+                    # 推送失败不影响账本，但必须说出来：否则线上看板会一直停在
+                    # 旧账本，而每轮 workflow 都是绿的，没人会发现。
+                    print("  [警告] 账本推送到云端失败：%s" % msg)
+            except Exception as e:  # noqa: BLE001
+                if verbose:
+                    print("  [警告] 推送异常：%s: %s" % (type(e).__name__, e))
+        elif verbose:
+            print("  [提示] 非云端环境，跳过账本推送（避免本地镜像覆盖线上）")
 
     return {"snapshot": snap, "events": events, "pool": pool, "acc": acc}
 
