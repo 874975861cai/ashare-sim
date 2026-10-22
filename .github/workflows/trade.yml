@@ -76,7 +76,7 @@ jobs:
       - name: 执行一轮
         env:
           TZ: Asia/Shanghai
-          SIM_CLOUD_URL: https://ashare-sim-dashboard.app.workbuddy.host
+          SIM_CLOUD_URL: https://ashare-sim-dashboard.app.workbuddy.link
           SIM_SYNC_TOKEN: ${{ secrets.SIM_SYNC_TOKEN }}
         run: |
           set +e
