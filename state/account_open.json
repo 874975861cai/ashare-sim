@@ -1,5 +1,5 @@
 {
-  "date": "2026-10-21",
+  "date": "2026-10-22",
   "account": {
     "meta": {
       "init_capital": 10000.0,
@@ -12,24 +12,24 @@
         "transfer_fee": 1e-05
       }
     },
-    "cash": 429.5,
+    "cash": 552.5,
     "positions": {
       "159915": {
         "name": "创业板ETF易方达",
         "lots": [
           {
-            "date": "2026-10-20",
+            "date": "2026-10-21",
             "shares": 3500,
-            "price": 2.733,
+            "price": 2.729,
             "fee": 5.0,
-            "time": "14:07"
+            "time": "13:00"
           }
         ],
         "realized": 0.0
       }
     },
-    "trade_seq": 1,
-    "today": "2026-10-20",
+    "trade_seq": 3,
+    "today": "2026-10-21",
     "peak_equity": 10000.0
   }
 }
