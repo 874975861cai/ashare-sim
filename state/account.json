@@ -10,23 +10,9 @@
       "transfer_fee": 1e-05
     }
   },
-  "cash": 484.4,
-  "positions": {
-    "159915": {
-      "name": "创业板ETF易方达",
-      "lots": [
-        {
-          "date": "2026-10-22",
-          "shares": 3600,
-          "price": 2.646,
-          "fee": 5.0,
-          "time": "10:25"
-        }
-      ],
-      "realized": 0.0
-    }
-  },
-  "trade_seq": 5,
-  "today": "2026-10-22",
+  "cash": 9655.8,
+  "positions": {},
+  "trade_seq": 6,
+  "today": "2026-10-23",
   "peak_equity": 10000.0
 }
