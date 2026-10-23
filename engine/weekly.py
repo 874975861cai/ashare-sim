@@ -334,8 +334,10 @@ def render_markdown(summary, gate_info, issues, bt, acc, audit=None):
         verdict = ("样本已达标（%d 笔 / %d 日），**可以评审参数**。"
                    % (gate_info["n_trades"], gate_info["n_days"]))
     else:
+        # 2026-10-23 修：门槛是「笔数 且 日数」两个条件同时满足，
+        # 原来写「或」把缺口说小了一半，容易让人误判「再撑几天就够了」。
         verdict = ("样本不足（%d 笔 / %d 日），**本周不调参，继续观察**。"
-                   "还差 %d 笔或 %d 个交易日。"
+                   "还差 %d 笔，且还差 %d 个交易日（两个条件都要满足）。"
                    % (gate_info["n_trades"], gate_info["n_days"],
                       gate_info["need_trades"], gate_info["need_days"]))
     if issues:
