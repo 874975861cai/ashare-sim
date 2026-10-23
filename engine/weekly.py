@@ -102,9 +102,15 @@ def deviations(trades, equity, acc):
     issues = []
 
     # 1) 过夜持仓
-    if acc.get("positions"):
-        issues.append("**存在过夜持仓**：%d 只，违反「日内平仓」原则"
-                      % len(acc["positions"]))
+    #    2026-10-23 修：股票型 ETF 是 T+1，当天买入的份额当天根本卖不掉，
+    #    过夜是交易规则强制的，不是执行偏离。只有 T+0 品种（跨境/黄金/债券）
+    #    才存在「本来可以日内平掉却没平掉」这种真正的偏离。
+    #    不加这个区分，周报会天天报「违规」，把真偏离淹掉。
+    forced = [c for c in acc.get("positions", {}) if not broker.is_t0_etf(c)]
+    avoidable = [c for c in acc.get("positions", {}) if broker.is_t0_etf(c)]
+    if avoidable:
+        issues.append("**存在可平未平的过夜持仓**：%s（T+0 品种，本可日内平仓）"
+                      % "、".join(avoidable))
 
     # 2) 单日交易超频
     per_day = {}
@@ -296,9 +302,20 @@ def render_markdown(summary, gate_info, issues, bt, acc, audit=None):
     recent = summary["recent"]
     total = summary["total"]
     init = acc["meta"]["init_capital"]
-    equity_val = fnum(acc.get("cash")) + sum(
-        broker.position_shares(p) * broker.avg_cost(p)
-        for p in acc.get("positions", {}).values())
+    # 权益必须取「市值口径」的那一行。账本 equity.csv 的最后一行是券商快照，
+    # 已按最新价重估；而 cash + 持仓成本 会把未平仓浮盈浮亏全部抹掉
+    # ——2026-10-23 就因此把 +201.60 报成 -344.20（差异正好是 512100 的浮盈）。
+    eq_rows = read_csv(broker.EQUITY_FILE)
+    if eq_rows and fnum(eq_rows[-1].get("equity")) > 0:
+        equity_val = fnum(eq_rows[-1].get("equity"))
+        equity_src = "市值口径（%s 快照）" % eq_rows[-1].get("date", "")
+    else:
+        equity_val = fnum(acc.get("cash")) + sum(
+            broker.position_shares(p) * broker.avg_cost(p)
+            for p in acc.get("positions", {}).values())
+        equity_src = "成本口径（无净值快照，未计入浮盈亏）"
+    forced_overnight = [c for c in acc.get("positions", {})
+                        if not broker.is_t0_etf(c)]
 
     L = []
     L.append("# 模拟盘周报 %s" % now.strftime("%Y-%m-%d"))
@@ -342,8 +359,9 @@ def render_markdown(summary, gate_info, issues, bt, acc, audit=None):
     L.append("| 最好 / 最差 | ¥%+.2f / ¥%+.2f | ¥%+.2f / ¥%+.2f |"
              % (recent["best"], recent["worst"], total["best"], total["worst"]))
     L.append("")
-    L.append("账户权益 ¥%.2f（初始 ¥%.0f），本期 %d 个交易日中空仓 %d 天。"
-             % (equity_val, init, summary["n_days_recent"], summary["flat_days"]))
+    L.append("账户权益 ¥%.2f（初始 ¥%.0f，%s），本期 %d 个交易日中空仓 %d 天。"
+             % (equity_val, init, equity_src,
+                summary["n_days_recent"], summary["flat_days"]))
     L.append("")
 
     # ---- 规则偏离 ----
@@ -354,6 +372,10 @@ def render_markdown(summary, gate_info, issues, bt, acc, audit=None):
             L.append("- " + s)
     else:
         L.append("- 无。仓位、频率、时段、强平均符合规则。")
+    if forced_overnight:
+        L.append("- （说明）持有 T+1 品种 %s，过夜是规则强制、非执行偏离；"
+                 "但这意味着**当日买入的仓位当日无法止损**，风险敞口实际是隔夜跳空。"
+                 % "、".join(forced_overnight))
     L.append("")
 
     # ---- 回测对照 ----

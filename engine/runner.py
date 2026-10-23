@@ -272,6 +272,21 @@ def run(verbose=True, params=None, execute=True, ttl=600):
                 if tm >= params["force_exit"] and act != "SELL" and can_sell:
                     act, reason = "SELL", "尾盘强平"
                 if act == "SELL" and execute:
+                    # 隔夜仓的「止盈/止损」是次日开盘跳空触发的，不是日内规则命中。
+                    # 不标出来，账本上会写成「止损(-3.72%)」，让人以为 0.4% 的
+                    # 止损真的把风险管住了 —— 实际上那晚一路亏到 -3.72% 才因为
+                    # 「次日能卖了」而平掉。这是 2026-10-23 复盘发现的记账失真，
+                    # 和 T+0 假成交是同一类问题：账本必须能被据以做决策。
+                    if pos.get("overnight"):
+                        if reason.startswith("止盈"):
+                            reason = "隔夜" + reason
+                        elif reason.startswith("止损"):
+                            reason = "隔夜" + reason
+                        elif reason.startswith("时间止损"):
+                            reason = "隔夜持有到次日早盘平仓(%s)" % \
+                                     reason[len("时间止损"):].strip("()")
+                        elif reason == "尾盘强平":
+                            reason = "隔夜持有到次日尾盘强平"
                     try:
                         r = broker.sell(acc, c, data[c]["name"] or c,
                                         ticks[k]["price"], pos["shares"], dt,
