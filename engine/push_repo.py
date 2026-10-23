@@ -15,6 +15,11 @@
     python engine/push_repo.py engine/foo.py a.md    # 推指定文件
     python engine/push_repo.py --all                 # 推本地领先的全部
     python engine/push_repo.py --all --message "..."  # 自定义提交信息
+
+推完之后本地引用会落后（API 造的 commit 本地没有对象），要手动对齐：
+    git fetch origin main && git reset --hard origin/main
+fetch 本身也可能被同一条代理打到 502，重试几次即可；
+内容一定是一致的——推上去的就是 git 里已存的 blob。
 """
 import argparse
 import base64
