@@ -1,5 +1,5 @@
 {
-  "date": "2026-10-23",
+  "date": "2026-10-26",
   "account": {
     "meta": {
       "init_capital": 10000.0,
@@ -12,24 +12,24 @@
         "transfer_fee": 1e-05
       }
     },
-    "cash": 484.4,
+    "cash": 330.4,
     "positions": {
-      "159915": {
-        "name": "创业板ETF易方达",
+      "512100": {
+        "name": "中证1000ETF南方",
         "lots": [
           {
-            "date": "2026-10-22",
+            "date": "2026-10-23",
             "shares": 3600,
-            "price": 2.646,
+            "price": 2.589,
             "fee": 5.0,
-            "time": "10:25"
+            "time": "10:23"
           }
         ],
         "realized": 0.0
       }
     },
-    "trade_seq": 5,
-    "today": "2026-10-22",
+    "trade_seq": 7,
+    "today": "2026-10-23",
     "peak_equity": 10000.0
   }
 }

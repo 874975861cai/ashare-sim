@@ -10,23 +10,9 @@
       "transfer_fee": 1e-05
     }
   },
-  "cash": 330.4,
-  "positions": {
-    "512100": {
-      "name": "中证1000ETF南方",
-      "lots": [
-        {
-          "date": "2026-10-23",
-          "shares": 3600,
-          "price": 2.589,
-          "fee": 5.0,
-          "time": "10:23"
-        }
-      ],
-      "realized": 0.0
-    }
-  },
-  "trade_seq": 7,
-  "today": "2026-10-23",
+  "cash": 10135.4,
+  "positions": {},
+  "trade_seq": 8,
+  "today": "2026-10-26",
   "peak_equity": 10000.0
 }
