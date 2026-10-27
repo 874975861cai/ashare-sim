@@ -10,9 +10,23 @@
       "transfer_fee": 1e-05
     }
   },
-  "cash": 10135.4,
-  "positions": {},
-  "trade_seq": 8,
+  "cash": 424.7,
+  "positions": {
+    "588000": {
+      "name": "科创50ETF华夏",
+      "lots": [
+        {
+          "date": "2026-10-27",
+          "shares": 7100,
+          "price": 1.367,
+          "fee": 5.0,
+          "time": "11:05"
+        }
+      ],
+      "realized": 0.0
+    }
+  },
+  "trade_seq": 9,
   "today": "2026-10-27",
   "peak_equity": 10000.0
 }
