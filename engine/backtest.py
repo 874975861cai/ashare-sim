@@ -17,12 +17,18 @@ import strategy    # noqa: E402
 CACHE = {}
 
 
-def load_pool(codes, ndays=5, verbose=True, offline=False):
+def load_pool(codes, ndays=5, verbose=True, offline=False, report=None):
     """加载分时，按交易日分组。preclose 用前一交易日最后价格。
 
     offline=True 时只读本地缓存，不发起网络请求（限流时用）。
+    report: 传入 dict 时回填 {"requested", "ok", "failed": [(code, 原因)]}。
+
+    为什么要 report：返回值只有「成功的那些」，少了哪只、为什么少，全被吞掉。
+    12/13 只和 3/13 只返回的都是一个非空 dict，调用方没法区分「池子完整」和
+    「大半标的拉取失败」。回测照跑，收益照算，看着完全正常。
     """
     out = {}
+    failed = []
     today = market.time.strftime("%Y%m%d")
     for c in codes:
         try:
@@ -35,6 +41,7 @@ def load_pool(codes, ndays=5, verbose=True, offline=False):
                 if not blob:
                     if verbose:
                         print(f"  - {c} 无缓存")
+                    failed.append((c, "无缓存"))
                     continue
                 tr = blob["data"]
             else:
@@ -42,12 +49,14 @@ def load_pool(codes, ndays=5, verbose=True, offline=False):
         except Exception as e:  # noqa: BLE001
             if verbose:
                 print(f"  ! {c} 拉取失败: {e}")
+            failed.append((c, "拉取失败: %s" % str(e)[:40]))
             continue
         # 0 根也要当失败：否则会建出 {"days": {}} 这种「存在但什么都没有」
         # 的条目，打印成「+ 588000 / 0 点 0 天」，看着像成功。
         if not tr.get("ticks"):
             if verbose:
                 print(f"  - {c} 无分时数据（0 根）")
+            failed.append((c, "0 根分时"))
             continue
         by_day = defaultdict(list)
         for t in tr["ticks"]:
@@ -60,9 +69,15 @@ def load_pool(codes, ndays=5, verbose=True, offline=False):
             else:
                 pre[d] = by_day[days[k - 1]][-1]["price"]
         out[c] = {"name": tr["name"] or c, "days": {d: by_day[d] for d in days},
-                  "preclose": pre}
+                  "preclose": pre, "first_day_no_preclose": days[0]}
         if verbose:
             print(f"  + {c} {(tr['name'] or c)[:14]:<16} {len(tr['ticks'])} 点 / {len(days)} 天")
+    if report is not None:
+        report.update({"requested": len(codes), "ok": len(out), "failed": failed})
+    if failed and verbose:
+        print("  ! %d/%d 只标的没加载成功：%s"
+              % (len(failed), len(codes),
+                 "、".join("%s(%s)" % (c, why) for c, why in failed)))
     return out
 
 
@@ -73,11 +88,40 @@ def trading_days(data):
     return sorted(ds)
 
 
+def _limit_block(code, name, preclose, side, quote, px):
+    """涨跌停/封板校验，口径对齐 broker.buy / broker.sell。
+
+    实盘 broker 会 Reject「涨停封板」「跌停封板」，回测原来根本不做这层判断：
+    涨停日照买（实盘买不到）、跌停日照卖（实盘卖不掉，会被封在里面过夜）。
+    这不是小数点的差别，是收益分布的形状——回测恰好在最极端的行情里给出
+    实盘拿不到的价格，于是系统性低估尾部亏损。optimize/weekly 都拿它的结果
+    做判断，所以这层缺失会一路传染。
+
+    返回 None 表示可成交，否则返回不能成交的原因。
+    """
+    if not preclose:
+        return None
+    up, down = broker.limit_prices(code, preclose, name)
+    if side == "BUY":
+        if quote > up + 1e-9:
+            return "涨停封板：报价 %.3f 高于涨停价 %.3f" % (quote, up)
+        if px > up + 1e-9:
+            return "涨停封板：吃一档后 %.3f 超过涨停价 %.3f" % (px, up)
+        return None
+    if quote < down - 1e-9:
+        return "跌停封板：报价 %.3f 低于跌停价 %.3f" % (quote, down)
+    if px < down - 1e-9:
+        return "跌停封板：让一档后 %.3f 跌破跌停价 %.3f" % (px, down)
+    return None
+
+
 def run_backtest(data, params, days, capital=10000.0, verbose=False):
     """组合回放：单票集中，全池扫描。
 
-    与实盘 broker 对齐的三条撮合规则（2026-10-20 代码自审补齐）：
+    与实盘 broker 对齐的四条撮合规则：
       * 滑点：买入 +1 tick / 卖出 -1 tick，与 broker.buy/sell 一致；
+      * 涨跌停/封板：成交价越过涨跌停价就拒单（2026-10-28 补）。以前只做滑点
+        不做限价校验，跌停日照样卖得出去——实盘那是 Reject，仓位会封在里面；
       * R6 大盘熔断：每分钟按 510300（缺则取池内首个标的）重算 market_pct，
         以前这里恒为 0.0，等于回测里根本没有熔断这条规则；
       * 停牌日权益：用最后一个已知价计市值，不能把持仓当消失了。
@@ -90,13 +134,32 @@ def run_backtest(data, params, days, capital=10000.0, verbose=False):
     start_equity = capital
     pos = None            # {code, entry, entry_idx, t, shares, day, overnight}
     trades = []
+    blocked = []          # 被涨跌停/封板挡下的单子，不能静默丢
     day_pnls = []
     last_px = {}          # code -> 最后一个已知成交价，停牌日用来计市值
+
+    def note_block(day, c, side, t, why, tag=""):
+        """同一天同一只同一方向同一性质只记第一条，否则跌停日会刷几百条。"""
+        key = (day, c, side, tag)
+        if key in seen_blocks:
+            return
+        seen_blocks.add(key)
+        blocked.append({"day": day, "code": c, "side": side, "t": t,
+                        "reason": why})
+
+    seen_blocks = set()
 
     # 大盘代理：实盘 runner 用 510300，池里没有就退化为首个标的
     mkt = "510300" if "510300" in data else (next(iter(data)) if data else None)
     if verbose and mkt != "510300":
         print(f"  ! 无 510300 数据，大盘熔断参照退化为 {mkt}")
+    # 窗口首日没有「前一交易日收盘」可用，preclose 只能取当日第一根价格。
+    # 那一分钟的 market_pct 因此恒为 0，R6 实际是「相对开盘」而非「相对昨收」，
+    # 会放行低开低走的日子。影响仅限首日，但必须说出来——不然读结果的人
+    # 以为整段回放都带着熔断这条规则。
+    if verbose and days and any(v.get("first_day_no_preclose") == days[0]
+                                for v in data.values()):
+        print(f"  · 首日 {days[0]} 无前收盘，R6 按「相对开盘」计，非相对昨收")
 
     for day in days:
         # 隔夜仓：昨天买入的 T+1 标的，今天才解锁。
@@ -149,8 +212,16 @@ def run_backtest(data, params, days, capital=10000.0, verbose=False):
                         pctx, params, can_sell=can_sell)
                     if act == "SELL":
                         # 卖方让一档，与 broker.sell 的撮合口径一致
+                        q = ticks[k]["price"]
                         px = broker.round_price(
-                            c, ticks[k]["price"] - broker.price_tick(c))
+                            c, q - broker.price_tick(c))
+                        why = _limit_block(c, data[c]["name"],
+                                           pctx["preclose"], "SELL", q, px)
+                        if why:
+                            # 跌停封板：实盘卖不掉，仓位继续留着。回测必须一样，
+                            # 否则回测能「在跌停价顺利离场」，实盘被封在里面过夜。
+                            note_block(day, c, "SELL", t, why)
+                            continue
                         amt = px * pos["shares"]
                         fee = broker.calc_fee(c, "SELL", amt)
                         proceeds = amt - fee["total"]
@@ -185,8 +256,16 @@ def run_backtest(data, params, days, capital=10000.0, verbose=False):
             if best:
                 _, c, ticks, k, reason = best
                 # 买方吃一档，与 broker.buy 的撮合口径一致
+                q = ticks[k]["price"]
                 px = broker.round_price(
-                    c, ticks[k]["price"] + broker.price_tick(c))
+                    c, q + broker.price_tick(c))
+                why = _limit_block(c, data[c]["name"],
+                                   data[c]["preclose"].get(day), "BUY", q, px)
+                if why:
+                    # 涨停封板买不到。实盘 runner 在这里也是 Reject 后空手收场
+                    # （只取最优一只，不换次优），回测保持同样的行为。
+                    note_block(day, c, "BUY", t, why)
+                    continue
                 # 用 97% 资金，整百份
                 budget = (cash - 5.5) * 0.97
                 shares = int(budget / px / 100) * 100
@@ -204,24 +283,34 @@ def run_backtest(data, params, days, capital=10000.0, verbose=False):
                                        "pnl": 0.0, "reason": reason})
 
         # 收盘仍未平仓：T+0 标的按最后价强平；T+1 标的当天买的根本卖不掉，带着过夜
-        if pos:
+        # 例外同 runner：mode="hold" 本来就要过夜，这里不能强平。否则持有型策略在
+        # 回测里退化成「每天买、每天尾盘卖」，和实盘跑的完全不是同一套规则。
+        if pos and params.get("mode") != "hold":
             c = pos["code"]
             can_close = bool(pos.get("overnight")) or broker.is_t0_etf(c)
             if can_close and day in data[c]["days"]:
                 last = data[c]["days"][day][-1]
                 # 强平同样是卖出，同样让一档
+                q = last["price"]
                 px = broker.round_price(
-                    c, last["price"] - broker.price_tick(c))
-                amt = px * pos["shares"]
-                fee = broker.calc_fee(c, "SELL", amt)
-                proceeds = amt - fee["total"]
-                cost = pos["entry"] * pos["shares"] + pos["fee_buy"]
-                cash += proceeds
-                trades.append({"day": day, "code": c, "name": data[c]["name"],
-                               "side": "SELL", "t": last["t"], "price": px,
-                               "shares": pos["shares"], "pnl": proceeds - cost,
-                               "reason": "收盘强平"})
-                pos = None
+                    c, q - broker.price_tick(c))
+                why = _limit_block(c, data[c]["name"],
+                                   data[c]["preclose"].get(day), "SELL", q, px)
+                if why:
+                    # 收盘封在跌停上，强平也卖不掉。仓位带着过夜，不是数据丢了。
+                    note_block(day, c, "SELL", last["t"], "收盘强平受阻：" + why,
+                               tag="close")
+                else:
+                    amt = px * pos["shares"]
+                    fee = broker.calc_fee(c, "SELL", amt)
+                    proceeds = amt - fee["total"]
+                    cost = pos["entry"] * pos["shares"] + pos["fee_buy"]
+                    cash += proceeds
+                    trades.append({"day": day, "code": c, "name": data[c]["name"],
+                                   "side": "SELL", "t": last["t"], "price": px,
+                                   "shares": pos["shares"], "pnl": proceeds - cost,
+                                   "reason": "收盘强平"})
+                    pos = None
 
         # 权益必须把持仓市值算进去：T+1 过夜仓只算现金的话，
         # 日盈亏会凭空少掉持仓那一大块，看着像"今天亏了"，其实是没结算。
@@ -245,13 +334,14 @@ def run_backtest(data, params, days, capital=10000.0, verbose=False):
             print(f"  {day}  日盈亏 {day_pnl:+8.2f}  权益 {equity_val:9.2f}")
 
     return {"final": round(equity_val, 2), "trades": trades,
-            "day_pnls": day_pnls, "open_pos": pos}
+            "day_pnls": day_pnls, "open_pos": pos, "blocked": blocked}
 
 
 def metrics(res, capital=10000.0):
     sells = [t for t in res["trades"] if t["side"] == "SELL"]
     wins = [t for t in sells if t["pnl"] > 0]
     n = len(sells)
+    op = res.get("open_pos") or None
     return {
         "ret_pct": round((res["final"] / capital - 1) * 100, 3),
         "pnl": round(res["final"] - capital, 2),
@@ -260,4 +350,10 @@ def metrics(res, capital=10000.0):
         "avg_pnl": round(sum(t["pnl"] for t in sells) / n, 2) if n else 0.0,
         "best": round(max([t["pnl"] for t in sells], default=0), 2),
         "worst": round(min([t["pnl"] for t in sells], default=0), 2),
+        # 回放窗口结束时还握着仓位：ret_pct 里含着未平仓市值，不能当成
+        # 「已实现收益」看。以前这个信息只藏在 res 里，metrics 一取就没了，
+        # 报告读起来像「1 笔完整往返」，实际是「1 笔买入 + 1 笔从未离场」。
+        "open_code": op["code"] if op else None,
+        "open_shares": op["shares"] if op else 0,
+        "blocked": len(res.get("blocked") or []),
     }

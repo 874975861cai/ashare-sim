@@ -30,6 +30,7 @@
 import argparse
 import ast
 import csv
+import hashlib
 import json
 import os
 import subprocess
@@ -787,10 +788,27 @@ def check_selftest():
         add(CRIT, "回归", "端到端自测", "%d 项失败：%s" % (max(len(fails), 1), detail))
 
 
+def _params_sig(params):
+    """策略参数指纹：用来区分「参数变了」和「代码行为变了」。"""
+    blob = json.dumps([[k, params[k]] for k in sorted(params)],
+                      ensure_ascii=False, default=str)
+    return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:8]
+
+
 def check_backtest_baseline():
     """同一份缓存、同一套参数，回测结果每次必须一样。
 
-    这是防「改了无关代码，策略行为悄悄变了」的最后一道闸。
+    这是防「改了无关代码，策略行为悄悄变了」的最后一道闸。它有两处会骗过自己：
+
+    1) 参数改了和代码坏了，报的是同一句话。只比 ret 时，「调了 dev_enter」
+       会打印成「结果漂移（同一份数据同一套参数）」—— 后半句是假的。真漂移
+       从此淹在假警报里，闸门等于没有。所以基线里存参数指纹，指纹变了就
+       明确说「参数变更，已重设基线」。
+
+    2) 2026-10-28 关闭入场后，回测恒为 0 笔 / 0.00%，此时「与基线一致」
+       什么都没校验：出场逻辑改坏了照样是 0.00%。所以回归探针固定用
+       entry_enabled=True 跑一遍，只比探针结果 —— 探针测的是代码，
+       不是「今天想不想交易」。
     """
     base_f = os.path.join(STATE, "baseline.json")
     try:
@@ -800,8 +818,9 @@ def check_backtest_baseline():
         add(WARN, "回归", "回测基线", "无法导入 backtest")
         return
     try:
+        rep = {}
         data = backtest.load_pool(strategy.CORE_POOL, ndays=5,
-                                  verbose=False, offline=True)
+                                  verbose=False, offline=True, report=rep)
         if not data:
             add(WARN, "回归", "回测基线", "本地缓存不足，跳过")
             return
@@ -810,47 +829,79 @@ def check_backtest_baseline():
         if not days:
             add(WARN, "回归", "回测基线", "无完整交易日")
             return
-        res = backtest.run_backtest(data, dict(strategy.PARAMS), days)
-        m = backtest.metrics(res)
+        live_p = dict(strategy.PARAMS)
+        probe_p = dict(strategy.PARAMS)
+        probe_p["entry_enabled"] = True
+        m = backtest.metrics(backtest.run_backtest(data, probe_p, days))
+        m_live = backtest.metrics(backtest.run_backtest(data, live_p, days))
         ret = round(float(m.get("ret_pct", 0)), 4)
         n = int(m.get("trades", 0))
+        sig = _params_sig(live_p)
     except Exception as e:  # noqa: BLE001
         add(WARN, "回归", "回测基线", "回测失败 %s" % str(e)[:60])
         return
 
+    # 标的缺失要说出来：12/13 只和 13/13 只的「一致」不是同一件事
+    miss = rep.get("failed") or []
+    tail = ""
+    if miss:
+        tail = "；%d/%d 只标的缺数据（%s），本轮回归没覆盖到它们" % (
+            len(miss), rep.get("requested", len(strategy.CORE_POOL)),
+            "、".join("%s:%s" % (c, str(w)[:16]) for c, w in miss[:3]))
+    live_txt = "现行参数 %.2f%% / %d 笔" % (float(m_live.get("ret_pct", 0)),
+                                          int(m_live.get("trades", 0)))
+    if m_live.get("open_code"):
+        live_txt += "，期末仍持有 %s %d 份（未平仓，收益含浮动）" % (
+            m_live["open_code"], m_live["open_shares"])
+
+    def save():
+        with open(base_f, "w", encoding="utf-8") as f:
+            json.dump({"ret_pct": ret, "trades": n, "days": days,
+                       "params": sig, "saved": datetime.now().strftime("%Y-%m-%d %H:%M")},
+                      f, ensure_ascii=False, indent=2)
+
     base = _read_json(base_f)
     if not base:
-        with open(base_f, "w", encoding="utf-8") as f:
-            json.dump({"ret_pct": ret, "trades": n,
-                       "days": days, "saved": datetime.now().strftime("%Y-%m-%d %H:%M")},
-                      f, ensure_ascii=False, indent=2)
-        add(OK, "回归", "回测基线", "首次建立基线 %.2f%% / %d 笔" % (ret, n))
+        save()
+        add(OK, "回归", "回测基线",
+            "首次建立基线 探针 %.2f%% / %d 笔（%s）%s" % (ret, n, live_txt, tail))
         return
 
-    same_days = base.get("days") == days
-    drift = abs(ret - float(base.get("ret_pct", 0)))
-    if not same_days:
+    if base.get("days") != days:
         # 缓存按天滚动，days 变了是常态，不是故障。但「换了数据集」和
-        # 「同一份数据结果漂移」必须分开说——旧逻辑会在这时报「与基线一致」，
-        # 那是假话：数据完全不同，根本没有可比性。
-        # 这里明确重设基线，并说清楚是按哪批数据重设的。
-        try:
-            with open(base_f, "w", encoding="utf-8") as f:
-                json.dump({"ret_pct": ret, "trades": n, "days": days,
-                           "saved": datetime.now().strftime("%Y-%m-%d %H:%M")},
-                          f, ensure_ascii=False, indent=2)
-        except OSError:
-            pass
+        # 「同一份数据结果漂移」必须分开说，否则报「与基线一致」是假话。
+        save()
         add(OK, "回归", "回测基线",
-            "数据集滚动（%d 日 → %d 日），已按新数据集重设基线 %.2f%% / %d 笔"
-            % (len(base.get("days") or []), len(days), ret, n))
+            "数据集滚动（%d 日 → %d 日），已按新数据集重设基线 探针 %.2f%% / %d 笔（%s）%s"
+            % (len(base.get("days") or []), len(days), ret, n, live_txt, tail))
         return
+
+    if "params" not in base:
+        # 旧格式基线没有参数指纹，只能补记，不能拿它判「参数变更」
+        save()
+        add(OK, "回归", "回测基线",
+            "旧基线补记参数指纹 %s，探针 %.2f%% / %d 笔（%s）%s"
+            % (sig, ret, n, live_txt, tail))
+        return
+
+    if base.get("params") != sig:
+        # 参数换了：结果当然会变，这不是回归。说清楚是谁变了、变成什么。
+        save()
+        add(OK, "回归", "回测基线",
+            "策略参数变更（%s → %s），已按新参数重设基线 探针 %.2f%% / %d 笔（%s）%s"
+            % (base.get("params") or "未记录", sig, ret, n, live_txt, tail))
+        return
+
+    drift = abs(ret - float(base.get("ret_pct", 0)))
     if drift > 0.05 or n != base.get("trades"):
         add(WARN, "回归", "回测基线",
-            "结果漂移：%.2f%%→%.2f%%，%d→%d 笔（同一份数据同一套参数）"
-            % (float(base.get("ret_pct", 0)), ret, base.get("trades", 0), n))
+            "结果漂移：探针 %.2f%%→%.2f%%，%d→%d 笔（同一份数据、参数指纹 %s 未变，"
+            "所以是代码行为变了）%s"
+            % (float(base.get("ret_pct", 0)), ret, base.get("trades", 0), n,
+               sig, tail))
     else:
-        add(OK, "回归", "回测基线", "%.2f%% / %d 笔，与基线一致" % (ret, n))
+        add(OK, "回归", "回测基线",
+            "探针 %.2f%% / %d 笔，与基线一致；%s%s" % (ret, n, live_txt, tail))
 
 
 # ==========================================================================
