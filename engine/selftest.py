@@ -652,5 +652,77 @@ def main():
     return 1 if failed else 0
 
 
+@case("腾讯K线：字段顺序是 开/收/高/低（不是 OHLC）")
+def t_tx_row_order():
+    """腾讯 K 线行的字段顺序反直觉：[时间, 开, 收, 高, 低, 量]。
+
+    这不是「另一种写法」，抄成 OHLC 会把收盘价当最高价用，
+    回撤、跳空、止盈止损全部偏移，而且不报错、曲线也画得出来。
+    """
+    row = market._tx_row(
+        ["2026-10-28", "3.400", "3.383", "3.412", "3.355", "100"], False)
+    check(row is not None, "行解析返回 None")
+    check(abs(row["open"] - 3.400) < 1e-9, "open 取错列：%s" % row["open"])
+    check(abs(row["close"] - 3.383) < 1e-9, "close 取错列：%s" % row["close"])
+    check(abs(row["high"] - 3.412) < 1e-9, "high 取错列：%s" % row["high"])
+    check(abs(row["low"] - 3.355) < 1e-9, "low 取错列：%s" % row["low"])
+    check(row["high"] >= row["low"], "high/low 反了：%s/%s" % (row["high"], row["low"]))
+    # 分钟线：时间戳是 YYYYMMDDhhmm，要切成 datetime 与 date
+    m = market._tx_row(
+        ["202610281500", "3.376", "3.383", "3.393", "3.375", "1236706.0"], True)
+    check(m["datetime"] == "2026-10-28 15:00", "分钟时间解析错：%s" % m.get("datetime"))
+    check(m["date"] == "2026-10-28", "分钟日期解析错：%s" % m.get("date"))
+
+
+@case("腾讯K线：首个入口失败必须自动换下一个")
+def t_tx_fallback():
+    """三个入口是同一后端、限流各自独立，任何一个挂了都要静默降级。
+
+    单入口实测约 600 次后返回空 JSON，若不做降级，复盘脚本会在
+    「数据抓了一半」的地方停住——这比直接报错更危险。
+    """
+    import json as _json
+
+    class _Resp:
+        def __init__(self, txt):
+            self._txt = txt
+
+        def read(self):
+            return self._txt.encode("utf-8")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    class _Opener:
+        def __init__(self):
+            self.hosts = []
+
+        def open(self, req, timeout=None):
+            host = req.full_url.split("/appstock")[0]
+            self.hosts.append(host)
+            if len(self.hosts) == 1:
+                raise OSError("模拟入口被限流")
+            return _Resp(_json.dumps({"data": {"sh510880": {"day": [
+                ["2026-10-28", "3.400", "3.383", "3.412", "3.355", "100"]]}}}))
+
+    fake = _Opener()
+    old_opener = market._TX_OPENER
+    old_down = dict(market._TX_HOST_DOWN)
+    market._TX_OPENER = fake
+    market._TX_HOST_DOWN.clear()
+    try:
+        rows = market.fetch_kline_tx("510880", "day", "", count=5)
+    finally:
+        market._TX_OPENER = old_opener
+        market._TX_HOST_DOWN.clear()
+        market._TX_HOST_DOWN.update(old_down)
+    check(len(fake.hosts) == 2, "没有切换入口，只试了 %d 个：%s" % (len(fake.hosts), fake.hosts))
+    check(len(rows) == 1 and abs(rows[0]["close"] - 3.383) < 1e-9,
+          "降级后数据不对：%s" % rows)
+
+
 if __name__ == "__main__":
     sys.exit(main())

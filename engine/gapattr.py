@@ -66,37 +66,63 @@ BARS_CACHE = {}
 
 
 def daily_bars(code, beg="20261001", end="20261231"):
-    """日线 open/close，权威口径。
+    """日线 open/close，权威口径。三级降级：腾讯 → 东财 → 本地快照。
 
     为什么不用分钟数据算「收盘」：
       state/cache 里的分钟文件是「当天某个时刻」抓的，午休抓的就只到 11:30。
       2026-10-21 那份只到 11:30，末价 2.728，而真实收盘 2.713 —
       用它做分割会把 -0.59% 的日内亏算成 -0.04%，跳空段被虚增。
       日线的开/收盘是结算口径，没有这个问题。
+
+    为什么以腾讯为主源（2026-10-28 接入）：东财 push2his 会限流，
+    复盘时连打几次就 RemoteDisconnected，脚本变成「能不能联网」的赌注。
+    腾讯 K 线是独立域名 + 三入口降级，同一天连取十几次都稳。
+
+    注意：**不把 end 传给腾讯**。实测区间取数带 end 会丢掉当天
+    （10-28 有 end 时末根是 10-27），所以只传 start，本地再按 end 过滤。
     """
-    if code in BARS_CACHE:
-        return BARS_CACHE[code]
-    import urllib.request
-    url = ("https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=%s"
-           "&fields1=f1,f2,f3&fields2=f51,f52,f53,f54,f55,f56,f57,f58"
-           "&klt=101&fqt=1&beg=%s&end=%s" % (market.secid(code), beg, end))
+    key = (code, beg, end)
+    if key in BARS_CACHE:
+        return BARS_CACHE[key]
+
+    def _d(s):
+        s = str(s)
+        return "%s-%s-%s" % (s[:4], s[4:6], s[6:8]) if len(s) == 8 else s
+
+    beg_d, end_d = _d(beg), _d(end)
     out = {}
+
+    # 1) 腾讯（无区间 end，避免丢当天）
     try:
-        op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with op.open(req, timeout=15) as r:
-            d = json.loads(r.read().decode("utf-8"))
-        for line in (d.get("data") or {}).get("klines") or []:
-            p = line.split(",")
-            if len(p) >= 5:
-                out[p[0]] = {"open": float(p[1]), "close": float(p[2]),
-                             "high": float(p[3]), "low": float(p[4])}
+        for r in market.fetch_kline_tx(code, "day", "qfq",
+                                       start=beg_d, count=640):
+            if beg_d <= r["date"] <= end_d:
+                out[r["date"]] = {"open": r["open"], "close": r["close"],
+                                  "high": r["high"], "low": r["low"]}
     except Exception:  # noqa: BLE001
         out = {}
 
+    # 2) 东财兜底
     if not out:
-        # 网络被限流（东财会 RemoteDisconnected）时读兜底文件，
-        # 不然复盘脚本就成了「能不能联网」的赌注。
+        import urllib.request
+        url = ("https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=%s"
+               "&fields1=f1,f2,f3&fields2=f51,f52,f53,f54,f55,f56,f57,f58"
+               "&klt=101&fqt=1&beg=%s&end=%s" % (market.secid(code), beg, end))
+        try:
+            op = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with op.open(req, timeout=15) as r:
+                d = json.loads(r.read().decode("utf-8"))
+            for line in (d.get("data") or {}).get("klines") or []:
+                p = line.split(",")
+                if len(p) >= 5:
+                    out[p[0]] = {"open": float(p[1]), "close": float(p[2]),
+                                 "high": float(p[3]), "low": float(p[4])}
+        except Exception:  # noqa: BLE001
+            out = {}
+
+    # 3) 本地快照兜底
+    if not out:
         fb = os.path.join(CACHE_DIR, "daykline_fallback.json")
         try:
             with open(fb, "r", encoding="utf-8") as f:
@@ -104,7 +130,7 @@ def daily_bars(code, beg="20261001", end="20261231"):
         except Exception:  # noqa: BLE001
             out = {}
 
-    BARS_CACHE[code] = out
+    BARS_CACHE[key] = out
     return out
 
 

@@ -402,6 +402,192 @@ def fetch_trends_tx(code):
             "ticks": ticks, "source": "tx"}
 
 
+# --------------------------------------------------------------------------
+# 腾讯 K 线（日 / 周 / 月 + 1~60 分钟）
+#
+# 为什么要有这一层：东财 push2his 有分钟级限流，复盘时连续抓几年日线会被
+# RemoteDisconnected 打断（2026-10-28 连续 3 次），而回测与归因都要求
+# 「同一批数据可重复取得」。腾讯 K 线是独立域名、独立限流池，三个入口
+# 互为备份，实测单入口约 600 次后才返回空 JSON。
+#
+# 口径必须记住的三件事（来自 a-stock-data 的 #52 / #57 实测）：
+#   1. 前复权是**等差口径**（逐次减去每股分红），不是等比。高分红老股早年
+#      会被减成负数，本函数遇 <=0 直接抛错。要跨源比对长区间，取
+#      adjust="" 拿不复权，再按比例因子换算。
+#   2. 成交量：科创板（688/689）是股，其余是手；ETF 1 手 = 100 份。
+#   3. 分钟线只有不复权。m1 每天 241 根（09:30 那根是集合竞价，竞价无成交
+#      就没有这根）；13:01 那根的开盘价是上午收盘价，不是午后第一笔。
+#
+# 与本项目的关系：这是「数据管道」的修复，不是策略的修复。策略是持有型，
+# 每天只要一个收盘价，qt.gtimg.cn 就够；但复盘、归因、回测复核需要可靠的
+# 历史数据，没有它就只能靠一次性抓取的快照推理——那正是之前计算出错的根源。
+# --------------------------------------------------------------------------
+TX_KLINE_HOSTS = ("https://ifzq.gtimg.cn",
+                  "https://proxy.finance.qq.com/ifzqgtimg",
+                  "https://web.ifzq.gtimg.cn")
+_TX_HOST_DOWN = {}          # host -> 冷却截止时间戳
+TX_HOST_COOLDOWN = 120      # 单入口失败后暂停使用的秒数
+_TX_OPENER = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}),
+    urllib.request.HTTPSHandler(context=_CTX))
+
+_TX_MINUTE_PERIODS = ("m1", "m5", "m15", "m30", "m60")
+_TX_PERIOD_MAX = {"day": 640, "week": 640, "month": 640}
+
+
+def _tx_kline_raw(path, param, timeout=15):
+    """按顺序试三个入口，空响应或异常视为该入口被限流。
+
+    走直连（ProxyHandler({})）而不是系统代理：本机出口代理会把腾讯部分
+    路径拦成 501，直连才稳。这是踩过的坑，别改回 urlopen。
+    """
+    errs = []
+    for host in TX_KLINE_HOSTS:
+        if _TX_HOST_DOWN.get(host, 0) > time.time():
+            continue
+        url = "%s%s?param=%s" % (host, path, param)
+        try:
+            req = urllib.request.Request(
+                url, headers=dict(UA, Referer="https://gu.qq.com/"))
+            with _TX_OPENER.open(req, timeout=timeout) as r:
+                txt = r.read().decode("utf-8", "ignore")
+            payload = json.loads(txt) if txt.strip() else {}
+        except Exception as e:  # noqa: BLE001
+            errs.append("%s:%s" % (host, type(e).__name__))
+            _TX_HOST_DOWN[host] = time.time() + TX_HOST_COOLDOWN
+            continue
+        if not isinstance(payload, dict):
+            errs.append("%s:顶层非对象" % host)
+            _TX_HOST_DOWN[host] = time.time() + TX_HOST_COOLDOWN
+            continue
+        if payload.get("msg") == "param error":
+            raise ValueError("腾讯K线参数错误(区间过长或代码不存在): %s" % param)
+        data = payload.get("data")
+        if isinstance(data, dict) and data:
+            return data, host
+        errs.append("%s:空响应" % host)
+        _TX_HOST_DOWN[host] = time.time() + TX_HOST_COOLDOWN
+    raise RuntimeError("腾讯K线三个入口均不可用: " + "; ".join(errs))
+
+
+def _tx_row(it, minute):
+    """腾讯行 → dict。字段顺序是 [时间, 开, 收, 高, 低, 量, ...]，**不是 OHLC。**
+
+    这个顺序反直觉，抄错就会把最高价当收盘价，而且不报错、曲线也画得出来。
+    """
+    if not isinstance(it, (list, tuple)) or len(it) < 5:
+        return None
+    try:
+        stamp = str(it[0])
+        row = {"open": float(it[1]), "close": float(it[2]),
+               "high": float(it[3]), "low": float(it[4]),
+               "volume": float(it[5]) if len(it) > 5 and it[5] not in (None, "") else None}
+    except (TypeError, ValueError):
+        return None
+    if minute:
+        row["datetime"] = "%s-%s-%s %s:%s" % (
+            stamp[:4], stamp[4:6], stamp[6:8], stamp[8:10], stamp[10:12])
+        row["date"] = "%s-%s-%s" % (stamp[:4], stamp[4:6], stamp[6:8])
+    else:
+        row["date"] = stamp[:10]
+    return row
+
+
+def fetch_kline_tx(code, period="day", adjust="qfq",
+                   start=None, end=None, count=640):
+    """腾讯 K 线。日/周/月（默认前复权）与 1/5/15/30/60 分钟（不复权）。
+
+    返回按时间升序的 list[dict]：date / open / high / low / close / volume
+    （分钟线另有 datetime）。date 统一 "YYYY-MM-DD"。
+
+    period: day / week / month / m1 / m5 / m15 / m30 / m60
+    adjust: "qfq"(默认) / "hfq" / "" （分钟线只接受 ""）
+    count : 日周月 <=640，分钟 <=320（m60 的 320 根约 80 个交易日）
+    """
+    period = str(period).lower()
+    sym = tx_symbol(code)
+    minute = period in _TX_MINUTE_PERIODS
+
+    if minute:
+        if adjust not in (None, ""):
+            raise ValueError("腾讯分钟线只有不复权，adjust 请留空")
+        if start or end:
+            raise ValueError("腾讯分钟线不支持 start/end，只能取最近 count 根")
+        count = int(count)
+        if not 1 <= count <= 320:
+            raise ValueError("分钟线 count 范围 1-320")
+        data, _host = _tx_kline_raw(
+            "/appstock/app/kline/mkline", "%s,%s,,%d" % (sym, period, count))
+        node = data.get(sym) or {}
+        arr = node.get(period) or []
+        rows = [r for r in (_tx_row(it, True) for it in arr) if r]
+    else:
+        adj = "" if adjust is None else str(adjust).lower()
+        count = min(int(count), _TX_PERIOD_MAX.get(period, 640))
+        if start and end:
+            param = "%s,%s,%s,%s,%d,%s" % (sym, period, start, end, count, adj)
+        elif start:
+            param = "%s,%s,%s,,%d,%s" % (sym, period, start, count, adj)
+        else:
+            param = "%s,%s,,,%d,%s" % (sym, period, count, adj)
+        data, _host = _tx_kline_raw("/appstock/app/fqkline/get", param)
+        node = data.get(sym) or {}
+        # 前复权落在 qfqday，不复权/后复权落在 day，兼容两种键
+        arr = node.get("qfq" + period) or node.get(period) or []
+        rows = [r for r in (_tx_row(it, False) for it in arr) if r]
+
+    if not rows:
+        raise RuntimeError("腾讯K线 %s %s 返回 0 根" % (sym, period))
+    for r in rows:
+        if r["close"] <= 0 or r["open"] <= 0:
+            raise RuntimeError(
+                "腾讯前复权出现非正价格(%s %s)，这是等差复权把早年减成负数的"
+                "已知问题；长区间请改用 adjust=''" % (sym, r["date"]))
+    rows.sort(key=lambda x: x.get("datetime") or x["date"])
+    return rows
+
+
+def fetch_daily_bars_tx(code, years=3, adjust=""):
+    """取最近 N 年日线，自动翻页合并去重。
+
+    默认**不复权**：前复权是等差口径，跨年比收益率会失真。
+
+    翻页写法有讲究——**传了 end 参数就会丢掉当天**（区间模式只返回已结算
+    的日期，2026-10-28 实测：有 end 末根是 10-27，只有 start 或无区间末根
+    是 10-28）。所以第一段必须无区间取最近 640 根，保证当天一定在内；
+    只有在需要更早历史时，才用 end=<已知最早日> 往前补，那种情况下
+    「丢当天」不会发生在缺口上。
+    """
+    today = time.strftime("%Y-%m-%d")
+    target_start = "%d-01-01" % (int(today[:4]) - int(years))
+    out = {}
+
+    for r in fetch_kline_tx(code, "day", adjust, count=640):
+        out[r["date"]] = r
+
+    guard = 0
+    while out and min(out) > target_start and guard < 8:
+        guard += 1
+        earliest = min(out)
+        try:
+            older = fetch_kline_tx(code, "day", adjust, start=target_start,
+                                   end=earliest, count=640)
+        except Exception:  # noqa: BLE001
+            break
+        added = 0
+        for r in older:
+            if r["date"] not in out:
+                out[r["date"]] = r
+                added += 1
+        if not added:
+            break
+        time.sleep(0.2)
+
+    if not out:
+        raise RuntimeError("腾讯日线分段取数全部失败: %s" % code)
+    return [out[d] for d in sorted(out) if d >= target_start]
+
+
 def fetch_quotes_tx(codes):
     """腾讯批量报价，返回与 fetch_quotes 同构的 dict。"""
     if not codes:
