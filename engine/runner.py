@@ -34,20 +34,64 @@ LAST_PUSH = ("", "")
 
 
 # --------------------------------------------------------------------------
-def reset_to_open(day):
-    """把账户恢复到当日开盘状态（幂等前提）。"""
+class StrategyChanged(RuntimeError):
+    """当日快照的策略指纹与当前参数不符：拒绝重放。"""
+
+
+def params_sig(params=None):
+    """策略参数指纹。只取影响成交决策的键，排序后哈希。"""
+    import hashlib
+    p = params if params is not None else strategy.PARAMS
+    keys = ("mode", "hold_target", "hold_entry_time", "hold_stop",
+            "entry_enabled", "dev_enter", "mom_turn", "rebound",
+            "take_profit", "stop_loss", "max_hold_min", "force_exit",
+            "earliest_entry", "latest_entry", "max_trades", "market_filter")
+    raw = json.dumps({k: p.get(k) for k in keys}, sort_keys=True,
+                     ensure_ascii=False, default=str)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
+
+
+def reset_to_open(day, params=None):
+    """把账户恢复到当日开盘状态（幂等前提）。
+
+    ⚠️ 2026-10-28 加的护栏：**当日快照必须带策略指纹**。
+
+    为什么必须拦：这个函数让「同一天跑多次」得到完全相同的结果，靠的是
+    「每次从开盘状态重放」。前提是**策略没有变过**——只要策略不变，
+    09:52 做出买入决定和 14:50 做出买入决定，事实是同一件事（回放的是
+    同一批分钟线，成交价也是那根分钟线的价）。
+
+    但盘中换策略再重放，就变成「用 09:52 的价格，执行 14:50 才做出的决定」——
+    这不是补单，是前视偏差。当天我已经犯过一次：改完持有型策略后触发云端，
+    引擎从 09:52 建仓，账面上像是提前几小时就知道要买，同时把当天早上
+    真实发生的止损一起重放掉了（成交从 10 笔退回 9 笔）。
+
+    所以：指纹不一致 → 直接抛错，宁可当天不交易，也不许改写历史。
+    """
     cur = broker.load_account()
+    sig = params_sig(params)
     if os.path.exists(OPEN_FILE):
         with open(OPEN_FILE, "r", encoding="utf-8") as f:
             op = json.load(f)
         if op.get("date") == day:
+            old = op.get("params_sig")
+            # 没有指纹的老快照同样要拦：无法确认当日策略是否变过，
+            # 就不能假设它没变。宁可停一天，也不能赌。
+            if old != sig:
+                raise StrategyChanged(
+                    "策略参数在盘中发生了变更（快照 %s → 当前 %s）。"
+                    "今日拒绝重放：重放会用早盘价格执行刚刚才做出的决定，"
+                    "属于前视偏差，并且会覆盖当日已经真实发生的成交。"
+                    "新策略从下一个交易日开始生效。"
+                    % (old or "（无指纹的旧快照）", sig))
             acc = op["account"]
             broker.save_account(acc)
             _drop_today_trades(day)
             return acc
-    # 当日首次运行：把当前账户存档为开盘状态
+    # 当日首次运行：把当前账户存档为开盘状态，并记下策略指纹
     with open(OPEN_FILE, "w", encoding="utf-8") as f:
-        json.dump({"date": day, "account": cur}, f, ensure_ascii=False, indent=2)
+        json.dump({"date": day, "account": cur, "params_sig": sig}, f,
+                  ensure_ascii=False, indent=2)
     _drop_today_trades(day)
     return cur
 
@@ -205,7 +249,14 @@ def run(verbose=True, params=None, execute=True, ttl=600):
 
     # 守卫通过后才动账本。顺序很重要：先确认今天真的有行情，再存档、再放账本。
     if execute:
-        acc = reset_to_open(day)
+        try:
+            acc = reset_to_open(day, params)
+        except StrategyChanged as e:
+            # 盘中换策略 → 当天既不重放也不交易。宁可错过一天，
+            # 也不能用早盘价格执行刚做出的决定，更不能覆盖真实成交。
+            LAST_SKIP = "strategy_changed"
+            print("  [拒绝执行] %s" % e)
+            return None
     # dry 也要把日期推到今天：否则 snapshot 会把今天的净值写进昨天那一行
     broker.roll_day(acc, day)
 

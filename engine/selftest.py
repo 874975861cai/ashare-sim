@@ -509,30 +509,31 @@ def t_bt_limit_down():
     """2026-10-28 补：回测原来不校验涨跌停。
 
     一字跌停日照样按「让一档」成交，等于让回测在最极端的行情里拿到
-    实盘拿不到的价格——系统性低估尾部亏损。这里把入场门槛全部钉死，
-    免得哪天调了 PARAMS 这个用例就悄悄失效。
+    实盘拿不到的价格——系统性低估尾部亏损。这里把 decide 换成桩，
+    只测撮合层：策略怎么想的不该影响「跌停到底能不能卖出」这个事实。
     """
     n = len(session_minutes())
-    px = []
-    for k in range(n):
-        if k < 40:
-            px.append(4.0 - 0.0009 * k)
-        elif k < 60:
-            px.append(px[-1] + 0.0016)
-        else:
-            px.append(px[-1] + 0.00012)
     d1, d2 = "2026-10-19", "2026-10-20"
     data = {"510050": {"name": "上证50ETF华夏",
-                       "days": {d1: mk_ticks(d1, px),
+                       "days": {d1: mk_ticks(d1, flat_prices(n, 4.0)),
                                 d2: mk_ticks(d2, [3.60] * n)},
                        "preclose": {d1: 4.0, d2: 4.0},
                        "first_day_no_preclose": d1}}
-    p = dict(strategy.PARAMS)
-    p.update({"entry_enabled": True, "mode": "day", "dev_enter": 0.005,
-              "min_day_drop": 0.001, "rebound": 0.002, "mom_turn": 0.0005,
-              "min_amount": 0, "min_price": 0.5, "market_filter": -0.05,
-              "max_trades": 3})
-    r = backtest.run_backtest(data, p, [d1, d2])
+
+    def fake_decide(ticks, i, pos, ctx, params, can_sell=True):
+        if pos is None:
+            return "BUY", "测试入场", {"dev": -0.01}
+        if can_sell:
+            return "SELL", "测试出场", {}
+        return "HOLD", "", {}
+
+    old = strategy.decide
+    strategy.decide = fake_decide
+    try:
+        r = backtest.run_backtest(data, dict(strategy.PARAMS), [d1, d2])
+    finally:
+        strategy.decide = old
+
     check(any(t["side"] == "BUY" for t in r["trades"]), "用例没构造出入场，测不到卖出")
     check(not [t for t in r["trades"] if t["side"] == "SELL"],
           "一字跌停日居然成交了卖出（实盘是 Reject，仓位会封在里面）")
@@ -559,6 +560,47 @@ def t_bt_load_report():
     check(rep.get("ok") == len(data), "report 的 ok 和实际返回不一致")
     check(any(c == "999999" for c, _ in (rep.get("failed") or [])),
           "不存在的代码没进 failed，调用方无从知道池子不完整")
+
+
+@case("盘中换策略：必须拒绝重放，不许用早盘价格执行新决定")
+def t_strategy_changed():
+    """2026-10-28 真实事故的回归闸门。
+
+    那天上午按旧策略止损卖出，下午改完持有型策略再触发云端，
+    引擎从 09:52 重放建仓：账面上像是提前几小时知道要买（前视偏差），
+    同时把早上真实发生的止损重放掉了（成交 10 笔退回 9 笔）。
+
+    幂等重放的前提是「策略不变」。变了就必须拦，宁可当天不交易。
+    """
+    with sandbox():
+        day = today()
+        n = len(session_minutes())
+        px = flat_prices(n, 4.0, -0.03)
+        ticks = mk_ticks(day, px)
+        q = {"510300": mk_quote("510300", px[-1])}
+        old = install_fake_market(
+            {"510300": {"ticks": ticks, "preclose": 4.0, "name": "沪深300ETF"}}, q)
+        try:
+            p1 = dict(strategy.PARAMS, mode="daytrade", entry_enabled=True,
+                      dev_enter=0.002, rebound=0.0, mom_turn=-1.0)
+            runner.run(verbose=False, execute=True, params=p1)
+            before = broker.load_account()
+            n_before = len(open(broker.TRADE_FILE, encoding="utf-8-sig").readlines())
+
+            # 盘中把策略改成持有型并指向另一只标的
+            p2 = dict(p1, mode="hold", hold_target="510880")
+            r = runner.run(verbose=False, execute=True, params=p2)
+            after = broker.load_account()
+            n_after = len(open(broker.TRADE_FILE, encoding="utf-8-sig").readlines())
+        finally:
+            restore_market(old)
+        check(r is None, "策略变更后仍然执行了重放（返回了结果）")
+        check(runner.LAST_SKIP == "strategy_changed",
+              "跳过原因不对：%r" % runner.LAST_SKIP)
+        check(n_before == n_after,
+              "重放改写了当日成交：%d 行 → %d 行" % (n_before, n_after))
+        check(before["cash"] == after["cash"],
+              "重放改写了现金：%.2f → %.2f" % (before["cash"], after["cash"]))
 
 
 @case("无未来函数：决策不看 i 之后的数据")
