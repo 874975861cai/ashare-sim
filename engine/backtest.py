@@ -29,6 +29,7 @@ def load_pool(codes, ndays=5, verbose=True, offline=False, report=None):
     """
     out = {}
     failed = []
+    degraded = []
     today = market.time.strftime("%Y%m%d")
     for c in codes:
         try:
@@ -70,14 +71,24 @@ def load_pool(codes, ndays=5, verbose=True, offline=False, report=None):
                 pre[d] = by_day[days[k - 1]][-1]["price"]
         out[c] = {"name": tr["name"] or c, "days": {d: by_day[d] for d in days},
                   "preclose": pre, "first_day_no_preclose": days[0]}
+        # 降级缓存（接口挂了，拿的是更早写下的文件）照样能用，但必须留痕：
+        # 回测/归因/优化都吃这份数据，用旧缓存算出来的结论要打折扣。
+        if tr.get("stale"):
+            degraded.append((c, tr.get("as_of") or "?"))
         if verbose:
-            print(f"  + {c} {(tr['name'] or c)[:14]:<16} {len(tr['ticks'])} 点 / {len(days)} 天")
+            print(f"  + {c} {(tr['name'] or c)[:14]:<16} {len(tr['ticks'])} 点 / {len(days)} 天"
+                  + ("  [降级缓存]" if tr.get("stale") else ""))
     if report is not None:
-        report.update({"requested": len(codes), "ok": len(out), "failed": failed})
+        report.update({"requested": len(codes), "ok": len(out), "failed": failed,
+                       "degraded": degraded})
     if failed and verbose:
         print("  ! %d/%d 只标的没加载成功：%s"
               % (len(failed), len(codes),
                  "、".join("%s(%s)" % (c, why) for c, why in failed)))
+    if degraded and verbose:
+        print("  ! %d 只标的用的是降级缓存（截至 %s）：结论要打折扣"
+              % (len(degraded),
+                 "、".join("%s@%s" % (c, t) for c, t in degraded)))
     return out
 
 

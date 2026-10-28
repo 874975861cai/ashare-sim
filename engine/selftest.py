@@ -22,6 +22,8 @@
     python engine/selftest.py -v       # 打印每个断言的细节
 退出码：0 = 全过，1 = 有失败。
 """
+import hashlib
+import json
 import os
 import shutil
 import sys
@@ -722,6 +724,146 @@ def t_tx_fallback():
     check(len(fake.hosts) == 2, "没有切换入口，只试了 %d 个：%s" % (len(fake.hosts), fake.hosts))
     check(len(rows) == 1 and abs(rows[0]["close"] - 3.383) < 1e-9,
           "降级后数据不对：%s" % rows)
+
+
+@case("报价降级：腾讯与东财都挂时要能用本地快照，不能直接抛错")
+def t_quote_snapshot_fallback():
+    """2026-10-28 自审：`_stale()` 只认 {"data": {"ticks": …}} 这一种形状，
+    而报价缓存是**扁平**的 {code: quote}。于是 fetch_quotes 的第三层降级
+    （「退回本地快照」）永远拿不到东西——那句 `[降级] 报价使用缓存快照`
+    是不可达代码，两个源都挂时直接抛错，与注释承诺的行为相反。
+    """
+    tmp = tempfile.mkdtemp(prefix="mkt_")
+    old_dir, old_get = market.CACHE_DIR, market._get
+    old_tx, old_pref = market.fetch_quotes_tx, market.PREFER_TX_INTRADAY
+    codes = ["510300"]
+    sig = hashlib.md5("|".join(sorted(codes)).encode()).hexdigest()[:8]
+    snapshot = {"510300": mk_quote("510300", 3.999, preclose=4.0)}
+    path = os.path.join(tmp, "q_%s_20260101_0930.json" % sig)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(snapshot, f)
+    market.CACHE_DIR = tmp
+    market.PREFER_TX_INTRADAY = True
+    market.fetch_quotes_tx = lambda cs: (_ for _ in ()).throw(RuntimeError("腾讯挂了"))
+
+    def _dead(url, retries=5, timeout=20):
+        raise RuntimeError("东财也挂了")
+
+    market._get = _dead
+    try:
+        q = market.fetch_quotes(codes)
+    finally:
+        market.CACHE_DIR, market._get = old_dir, old_get
+        market.fetch_quotes_tx, market.PREFER_TX_INTRADAY = old_tx, old_pref
+        shutil.rmtree(tmp, ignore_errors=True)
+    check("510300" in q, "没退回快照，返回了 %s" % q)
+    check(abs(q["510300"]["price"] - 3.999) < 1e-9,
+          "快照价格不对：%s" % q["510300"].get("price"))
+
+
+@case("报价：腾讯只给一半时必须补东财，不能把残缺结果当完整")
+def t_quote_partial_fill():
+    """腾讯返回 200 但其中一只字段不全时，原逻辑 out 非空就当成成功返回，
+    缺的那只静默消失；下游 validate_pool 对「没报价」和「不达标」都是
+    continue，两者无法区分。"""
+    tmp = tempfile.mkdtemp(prefix="mkt_")
+    old_dir, old_tx, old_em = market.CACHE_DIR, market.fetch_quotes_tx, market._quotes_em
+    market.CACHE_DIR = tmp
+    market.fetch_quotes_tx = lambda cs: {"510300": mk_quote("510300", 4.0)}
+    market._quotes_em = lambda cs: {"510500": mk_quote("510500", 6.0)}
+    try:
+        q = market.fetch_quotes(["510300", "510500"])
+    finally:
+        market.CACHE_DIR, market.fetch_quotes_tx, market._quotes_em = old_dir, old_tx, old_em
+        shutil.rmtree(tmp, ignore_errors=True)
+    check(set(q) == {"510300", "510500"}, "缺的那只没补齐，只有 %s" % sorted(q))
+    check(abs(q["510500"]["price"] - 6.0) < 1e-9, "补来的价格不对")
+
+
+@case("分时降级：用旧缓存必须带 stale 标记，否则故障会被伪装成正常数据")
+def t_trends_degrade_marked():
+    tmp = tempfile.mkdtemp(prefix="mkt_")
+    old_dir, old_get = market.CACHE_DIR, market._get
+    old_tx, old_pref = market.fetch_trends_tx, market.PREFER_TX_INTRADAY
+    yday = days_before(1)
+    blob = {"_ts": 0, "data": {"code": "510300", "name": "沪深300ETF",
+                               "preclose": 4.0,
+                               "ticks": mk_ticks(yday, flat_prices(5, 4.0))}}
+    with open(os.path.join(tmp, "trends_510300_1_20260101.json"), "w",
+              encoding="utf-8") as f:
+        json.dump(blob, f)
+    market.CACHE_DIR = tmp
+    market.PREFER_TX_INTRADAY = False
+    market.fetch_trends_tx = lambda c: None
+
+    def _dead(url, retries=5, timeout=20):
+        raise RuntimeError("接口挂了")
+
+    market._get = _dead
+    try:
+        tr = market.fetch_trends("510300", ndays=1, ttl=0)
+    finally:
+        market.CACHE_DIR, market._get = old_dir, old_get
+        market.fetch_trends_tx, market.PREFER_TX_INTRADAY = old_tx, old_pref
+        shutil.rmtree(tmp, ignore_errors=True)
+    check(tr.get("stale") is True, "降级数据没有 stale 标记")
+    check((tr.get("as_of") or "").startswith(yday),
+          "as_of 应指向缓存里的那天 %s，实际 %s" % (yday, tr.get("as_of")))
+
+
+@case("交易日守卫：只有旧缓存时算数据故障，不算非交易日")
+def t_stale_is_fault_not_holiday():
+    """守卫原来只看「tick 日期是不是今天」，两个完全不同的原因报同一句话：
+    日历原因（周末/节假日）和数据源故障。前者退出码 2 正常跳过，后者是故障。
+    混在一起 → 接口挂一整天，workflow 全绿、日志干净。"""
+    yq = {"510300": mk_quote("510300", 4.0)}
+    yday = days_before(1)
+    with sandbox():
+        broker.load_account()
+        ticks = mk_ticks(yday, flat_prices(20, 4.0))
+        old = install_fake_market(
+            {"510300": {"ticks": ticks, "preclose": 4.0, "name": "沪深300ETF",
+                        "stale": True, "as_of": ticks[-1]["t"]}}, yq)
+        try:
+            res = runner.run(verbose=False, execute=False)
+            reason = runner.LAST_SKIP
+        finally:
+            restore_market(old)
+        check(res is None, "旧缓存不该产出账本")
+        check(reason == "stale_data", "跳过原因应为 stale_data，实际 %r" % reason)
+
+    # 反向：正常的旧日期行情（没有 stale 标记）= 真的非交易日，必须仍是原原因
+    with sandbox():
+        broker.load_account()
+        ticks = mk_ticks(yday, flat_prices(20, 4.0))
+        old = install_fake_market(
+            {"510300": {"ticks": ticks, "preclose": 4.0, "name": "沪深300ETF"}}, yq)
+        try:
+            runner.run(verbose=False, execute=False)
+            reason = runner.LAST_SKIP
+        finally:
+            restore_market(old)
+        check(reason == "not_trading_day", "非交易日原因被改坏了：%r" % reason)
+
+
+@case("云端退出码：策略当日变更 → 5，不混进数据故障 3")
+def t_cloud_strategy_changed_code():
+    import cloud_run
+    old_run, old_skip, old_win = runner.run, runner.LAST_SKIP, cloud_run.in_window
+    try:
+        cloud_run.in_window = lambda now=None: (True, "10:00")
+        runner.run = lambda **k: None
+        runner.LAST_SKIP = "strategy_changed"
+        code_changed = cloud_run.main([])
+        runner.LAST_SKIP = "stale_data"
+        code_stale = cloud_run.main([])
+        runner.LAST_SKIP = "not_trading_day"
+        code_holiday = cloud_run.main([])
+    finally:
+        runner.run, runner.LAST_SKIP, cloud_run.in_window = old_run, old_skip, old_win
+    check(code_changed == 5, "策略变更加护栏应返回 5，实际 %s" % code_changed)
+    check(code_stale == 3, "旧缓存应算数据故障 3，实际 %s" % code_stale)
+    check(code_holiday == 2, "非交易日应仍是 2，实际 %s" % code_holiday)
 
 
 if __name__ == "__main__":

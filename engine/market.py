@@ -141,8 +141,16 @@ def _write(path, obj):
                 pass
 
 
-def _stale(pattern_prefix):
+def _stale(pattern_prefix, kind="ticks"):
     """按前缀取最近的缓存文件（限流时的降级数据）。
+
+    kind 必须和数据形状对上，否则降级通道会「看起来存在、实际永远拿不到」：
+      * "ticks"  → 分时缓存，形如 {"_ts":…, "data": {"ticks": [...]}}
+      * "quotes" → 批量报价缓存，形如 {"510300": {...}, ...}（**扁平，没有 data 层**）
+
+    2026-10-28 自审实测：只认 ticks 时，fetch_quotes 第三层「退回本地快照」
+    永远返回 None——那句「[降级] 报价使用缓存快照」是不可达代码。两个数据源
+    同时挂掉时它不是用快照，而是直接抛错，和注释承诺的行为完全相反。
 
     跳过 0 根的缓存：那是历史上把「接口返回空」当成功写下的脏文件，
     拿它当降级数据等于把空结果一路传到下游，还不如直接返回 None。
@@ -156,12 +164,37 @@ def _stale(pattern_prefix):
             blob = _read(os.path.join(CACHE_DIR, name))
             if not blob:
                 continue
+            if kind == "quotes":
+                # 报价缓存的「有内容」= 每个值都是带正价格的报价 dict
+                if (isinstance(blob, dict) and blob
+                        and all(isinstance(v, dict) and v.get("price")
+                                for v in blob.values())):
+                    return blob
+                continue
             tk = (blob.get("data") or {}).get("ticks")
             if tk:            # 有内容的才算数
                 return blob
         return None
     except Exception:  # noqa: BLE001
         return None
+
+
+def _degrade(blob, why):
+    """把缓存包装成「降级数据」返回：带 stale 标记与数据截止时间。
+
+    为什么必须留标记：调用方原来无法区分「刚拉到的今天的分时」和「昨天写的
+    缓存」。runner 有交易日守卫，日期不对还能拦下；但拦下之后它只知道
+    「今天没行情」，于是把**数据源故障**报成**非交易日**（退出码 2 / 正常跳过），
+    接口挂一整天也全绿。标记一路带上去，守卫才能说出真实原因。
+
+    返回浅拷贝，不把 stale 写回缓存文件（否则下一次读缓存会一直以为自己旧）。
+    """
+    data = dict(blob.get("data") or {})
+    ticks = data.get("ticks") or []
+    data["stale"] = True
+    data["stale_reason"] = why
+    data["as_of"] = ticks[-1].get("t") if ticks else None
+    return data
 
 
 def load_cached_trends(code, ndays=1):
@@ -241,6 +274,20 @@ def _norm(x):
     if x in ("-", "", None):
         return None
     return x
+
+
+def _num(x):
+    """转 float，转不动就 None。
+
+    东财的 preClose 在停牌/新股/除权当口会返回 "-"。原样透传到 runner，
+    `("-" or ticks[0])` 取的是 "-"（非空字符串是真值），随后 `mk / mkt_pre`
+    抛 TypeError——从「接口给了个占位符」变成「整轮崩掉」。转成 None 后，
+    调用方的 `or ticks[0]["price"]` 兜底才真的生效。
+    """
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
 
 
 _ETFCACHE = {"ts": 0.0, "data": None}
@@ -697,10 +744,11 @@ def fetch_trends(code, ndays=1, ttl=600):
             except Exception:  # noqa: BLE001
                 pass
         if cached:
-            return cached["data"]
+            age = max(0.0, (time.time() - cached.get("_ts", 0)) / 60.0)
+            return _degrade(cached, "接口失败，用今天的旧缓存（%.0f 分钟前）" % age)
         old = _stale(f"trends_{code}_{ndays}_")
         if old:
-            return old["data"]
+            return _degrade(old, "接口失败，无当日缓存，用更早的缓存")
         raise
     data = (d or {}).get("data") or {}
     ticks = []
@@ -720,7 +768,7 @@ def fetch_trends(code, ndays=1, ttl=600):
     out = {
         "code": data.get("code") or code,
         "name": data.get("name"),
-        "preclose": data.get("preClose"),
+        "preclose": _num(data.get("preClose")),
         "ticks": ticks,
     }
     # 0 根不能当成功返回，更不能写进缓存。
@@ -730,13 +778,37 @@ def fetch_trends(code, ndays=1, ttl=600):
     # 的所有读取（缓存里躺着的是空数据）。空 = 这一路失败，应该降级或抛错。
     if not ticks:
         if cached:
-            return cached["data"]
+            age = max(0.0, (time.time() - cached.get("_ts", 0)) / 60.0)
+            return _degrade(cached, "接口返回 0 根，用今天的旧缓存（%.0f 分钟前）" % age)
         old = _stale("trends_%s_%d_" % (code, ndays))
         if old:
-            return old["data"]
+            return _degrade(old, "接口返回 0 根，无当日缓存，用更早的缓存")
         raise RuntimeError("%s 分时返回 0 根（接口无数据）" % code)
     _write(path, {"_ts": time.time(), "data": out})
     return out
+
+
+def _quotes_em(codes):
+    """东财批量报价。返回 {code: quote}，空值标的不进结果。"""
+    ids = ",".join(secid(c) for c in codes)
+    url = ("https://push2.eastmoney.com/api/qt/ulist.np/get?fltt=2&invt=2"
+           f"&secids={ids}&fields=f2,f3,f5,f6,f12,f14,f15,f16,f17,f18")
+    d = _get(url)
+    got = {}
+    for r in (((d or {}).get("data") or {}).get("diff") or []):
+        if _norm(r.get("f2")) is None:
+            continue
+        got[str(r.get("f12"))] = {
+            "code": str(r.get("f12")), "name": r.get("f14"),
+            "price": float(r.get("f2")),
+            "pct": float(_norm(r.get("f3")) or 0),
+            "amount": float(_norm(r.get("f6")) or 0),
+            "high": float(_norm(r.get("f15")) or 0),
+            "low": float(_norm(r.get("f16")) or 0),
+            "open": float(_norm(r.get("f17")) or 0),
+            "preclose": float(_norm(r.get("f18")) or 0),
+        }
+    return got
 
 
 def fetch_quotes(codes):
@@ -756,41 +828,33 @@ def fetch_quotes(codes):
     # 1) 首选腾讯：一次请求拿全部，响应快且不像东财那样限流
     if PREFER_TX_INTRADAY:
         try:
-            out = fetch_quotes_tx(codes)
+            out = fetch_quotes_tx(codes) or {}
         except Exception:  # noqa: BLE001
             out = {}
 
-    # 2) 东财兜底
-    if not out:
-        ids = ",".join(secid(c) for c in codes)
-        url = ("https://push2.eastmoney.com/api/qt/ulist.np/get?fltt=2&invt=2"
-               f"&secids={ids}&fields=f2,f3,f5,f6,f12,f14,f15,f16,f17,f18")
+    # 2) 东财兜底。触发条件不能是「腾讯整体失败」——腾讯返回 200 但其中一只
+    #    字段不全（价格解析失败 / 行被截断）时，out 非空却没有那一只，原来
+    #    就直接把残缺结果当完整结果返回并写进缓存了。下游 validate_pool 对
+    #    「这只没报价」和「这只不达标」处理完全一样（都 continue），于是
+    #    少一只标的和这只不够格无法区分。改成按 code 逐个补齐。
+    missing = [c for c in codes if c not in out]
+    if missing:
         try:
-            d = _get(url)
-            got = {}
-            for r in (((d or {}).get("data") or {}).get("diff") or []):
-                if _norm(r.get("f2")) is None:
-                    continue
-                got[str(r.get("f12"))] = {
-                    "code": str(r.get("f12")), "name": r.get("f14"),
-                    "price": float(r.get("f2")),
-                    "pct": float(_norm(r.get("f3")) or 0),
-                    "amount": float(_norm(r.get("f6")) or 0),
-                    "high": float(_norm(r.get("f15")) or 0),
-                    "low": float(_norm(r.get("f16")) or 0),
-                    "open": float(_norm(r.get("f17")) or 0),
-                    "preclose": float(_norm(r.get("f18")) or 0),
-                }
-            out = got
+            for c, q in _quotes_em(missing).items():
+                out.setdefault(c, q)
         except Exception:  # noqa: BLE001
-            out = {}
+            pass
+        missing = [c for c in codes if c not in out]
+        if missing:
+            print("  [报价] %d/%d 只没拿到：%s（腾讯与东财都缺）"
+                  % (len(missing), len(codes), "、".join(missing)))
 
     if out:
         _write(path, out)
         return out
 
-    # 3) 都失败，退回本地快照
-    old = _stale(f"q_{sig}_")
+    # 3) 都失败，退回本地快照（形如 {code: quote}，扁平结构）
+    old = _stale(f"q_{sig}_", "quotes")
     if old:
         print(f"  [降级] 报价使用缓存快照（{len(old)} 只）")
         return {k: old[k] for k in codes if k in old}

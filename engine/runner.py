@@ -242,10 +242,28 @@ def run(verbose=True, params=None, execute=True, ttl=600):
     # 定时自动跑，节假日必然命中，所以这道守卫是上云的前置条件。
     _days = {t["t"][:10] for tr in data.values() for t in tr["ticks"] if t.get("t")}
     if day not in _days:
+        # 「今天没有行情」有两种完全不同的原因，不能都报成非交易日：
+        #   日历原因 → 正常跳过（退出码 2）
+        #   数据源原因（接口挂了，只能拿旧缓存）→ 故障（退出码 3，workflow 会警告）
+        # 原来一律是 not_trading_day，于是接口挂一整天也和周末长得一模一样。
+        stale = sorted(c for c, tr in data.items() if tr.get("stale"))
+        if stale:
+            LAST_SKIP = "stale_data"
+            print("数据源异常：%s 只拿到旧缓存（%s），没有今天 %s 的分时"
+                  % ("、".join(stale), "、".join(sorted(_days)) or "无", day))
+            return None
         LAST_SKIP = "not_trading_day"
         print("非交易日或尚未开盘：拿到的是 %s 的分时，今天 %s"
               % ("、".join(sorted(_days)) or "无", day))
         return None
+
+    # 日期对得上、但数据是缓存降级来的：本轮重放会在缓存截止处停下，
+    # 不会崩、也不会错账（下一轮补齐），但必须留一行痕迹，否则「今天只重放
+    # 到 11:30」这种事没人看得出来。
+    degraded = [(c, tr.get("as_of") or "?") for c, tr in data.items() if tr.get("stale")]
+    if degraded and verbose:
+        print("  [降级] %s 的数据来自缓存，本轮重放窗口被截短"
+              % "、".join("%s@%s" % (c, t) for c, t in sorted(degraded)))
 
     # 守卫通过后才动账本。顺序很重要：先确认今天真的有行情，再存档、再放账本。
     if execute:
