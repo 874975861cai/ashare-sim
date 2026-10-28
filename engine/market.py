@@ -532,8 +532,10 @@ def fetch_kline_tx(code, period="day", adjust="qfq",
             param = "%s,%s,,,%d,%s" % (sym, period, count, adj)
         data, _host = _tx_kline_raw("/appstock/app/fqkline/get", param)
         node = data.get(sym) or {}
-        # 前复权落在 qfqday，不复权/后复权落在 day，兼容两种键
-        arr = node.get("qfq" + period) or node.get(period) or []
+        # 复权方式决定键名：qfq→qfqday / hfq→hfqday / 不复权→day。
+        # 只找 qfqday 会让 hfq 静默返回 0 根（写错过一次）。
+        key = {"qfq": "qfq" + period, "hfq": "hfq" + period}.get(adj, period)
+        arr = node.get(key) or node.get(period) or []
         rows = [r for r in (_tx_row(it, False) for it in arr) if r]
 
     if not rows:
@@ -585,7 +587,29 @@ def fetch_daily_bars_tx(code, years=3, adjust=""):
 
     if not out:
         raise RuntimeError("腾讯日线分段取数全部失败: %s" % code)
-    return [out[d] for d in sorted(out) if d >= target_start]
+    rows = [out[d] for d in sorted(out) if d >= target_start]
+
+    # 后复权在「当天」这一根常常没按复权因子更新，会造成整条序列末端出现
+    # 假跳变。2026-10-28 实测 510880：不复权 3.383、前复权 3.380、后复权
+    # 却是 4.29（应为约 3.249）—— 十只 ETF 全都在同一天出现 100%~200% 的
+    # 「涨幅」，纯属脏数据。用不复权的当日涨跌做对照，对不上就丢弃末根。
+    # 不猜 open/high/low：回测与回撤都用不到当天，编一根比缺一根更危险。
+    if str(adjust).lower() == "hfq" and len(rows) >= 3:
+        try:
+            raw = fetch_kline_tx(code, "day", "", count=2)
+            if len(raw) >= 2 and raw[-1]["date"] == rows[-1]["date"]:
+                r_hfq = rows[-1]["close"] / rows[-2]["close"] - 1
+                r_raw = raw[-1]["close"] / raw[-2]["close"] - 1
+                if abs(r_hfq - r_raw) > 0.05:
+                    dropped = rows[-1]
+                    rows = rows[:-1]
+                    if os.environ.get("TS_VERBOSE"):
+                        print("  [数据] %s 后复权末根(%s)与不复权不符，已丢弃"
+                              % (code, dropped["date"]))
+        except Exception:  # noqa: BLE001
+            pass
+
+    return rows
 
 
 def fetch_quotes_tx(codes):
