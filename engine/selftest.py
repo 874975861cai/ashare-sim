@@ -30,6 +30,7 @@ from contextlib import contextmanager
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import backtest    # noqa: E402
 import broker      # noqa: E402
 import doctor      # noqa: E402
 import market      # noqa: E402
@@ -429,8 +430,14 @@ def t_idempotent():
         check(len(r1["events"]) == len(r2["events"]), "两次运行事件数不同")
 
 
-@case("过夜仓：不开新仓，且按日内规则平掉")
+@case("持有型：过夜仓必须保留，且不能开第二只")
 def t_overnight():
+    """mode="hold" 下仓位就是要过夜，这是设计目标，不是故障。
+
+    2026-10-28 换策略前，这条断言是「尾盘必须平掉」——那时策略是日内。
+    换结构后如果还这么断言，测试就在拒绝正确行为，所以同步改成
+    「持有必须保持」。同时仍然守住老 bug：不能因为空仓判断错而开第二只。
+    """
     with sandbox():
         acc = broker.load_account()
         seed_position(acc, "510300", 1000, 4.0, days_before(7))
@@ -447,14 +454,26 @@ def t_overnight():
         try:
             runner.run(verbose=False, execute=True)
             a = broker.load_account()
+            rows = doctor._read_trades()
         finally:
             restore_market(old)
-        check(len(a["positions"]) <= 1, "过夜仓期间又开了第二只：%s" % list(a["positions"]))
-        check(not a["positions"], "尾盘没平掉，仓位过夜了：%s" % list(a["positions"]))
+        check(len(a["positions"]) <= 1,
+              "过夜仓期间又开了第二只：%s" % list(a["positions"]))
+        check("510300" in a["positions"],
+              "持有型策略把仓位平掉了，等于退回日内：%s" % list(a["positions"]))
+        check(not any(r["side"] == "SELL" for r in rows),
+              "持有型策略不该产生任何卖出：%s"
+              % [r["reason"] for r in rows if r["side"] == "SELL"])
 
 
-@case("尾盘缺数据：兜底强平必须生效")
+@case("日内模式仍可切换：daytrade 下兜底强平必须生效")
 def t_missing_tail():
+    """切到 hold 之后，旧的日内能力不能丢。
+
+    这是给未来的自己留的回归闸门：如果哪天想切回日内（或跑对照实验），
+    尾盘强平必须还在。两处强平（循环内 + 收盘兜底）都要覆盖到，
+    只改一处就会出现「白天平了、缺数据时过夜」的半吊子状态。
+    """
     with sandbox():
         acc = broker.load_account()
         seed_position(acc, "510300", 1000, 4.0, days_before(7))
@@ -474,7 +493,8 @@ def t_missing_tail():
             # max_hold 放宽，让它不会在上午被时间止损掉，
             # 这样才能测到「尾盘缺数据」这一条路径
             runner.run(verbose=False, execute=True,
-                       params=dict(strategy.PARAMS, max_hold_min=400))
+                       params=dict(strategy.PARAMS, mode="daytrade",
+                                   max_hold_min=400))
             a = broker.load_account()
         finally:
             restore_market(old)
@@ -482,6 +502,63 @@ def t_missing_tail():
         rows = doctor._read_trades()
         check(any(r["side"] == "SELL" and "强平" in r["reason"] for r in rows),
               "兜底强平没触发")
+
+
+@case("回测：跌停封板不能假装卖出")
+def t_bt_limit_down():
+    """2026-10-28 补：回测原来不校验涨跌停。
+
+    一字跌停日照样按「让一档」成交，等于让回测在最极端的行情里拿到
+    实盘拿不到的价格——系统性低估尾部亏损。这里把入场门槛全部钉死，
+    免得哪天调了 PARAMS 这个用例就悄悄失效。
+    """
+    n = len(session_minutes())
+    px = []
+    for k in range(n):
+        if k < 40:
+            px.append(4.0 - 0.0009 * k)
+        elif k < 60:
+            px.append(px[-1] + 0.0016)
+        else:
+            px.append(px[-1] + 0.00012)
+    d1, d2 = "2026-10-19", "2026-10-20"
+    data = {"510050": {"name": "上证50ETF华夏",
+                       "days": {d1: mk_ticks(d1, px),
+                                d2: mk_ticks(d2, [3.60] * n)},
+                       "preclose": {d1: 4.0, d2: 4.0},
+                       "first_day_no_preclose": d1}}
+    p = dict(strategy.PARAMS)
+    p.update({"entry_enabled": True, "mode": "day", "dev_enter": 0.005,
+              "min_day_drop": 0.001, "rebound": 0.002, "mom_turn": 0.0005,
+              "min_amount": 0, "min_price": 0.5, "market_filter": -0.05,
+              "max_trades": 3})
+    r = backtest.run_backtest(data, p, [d1, d2])
+    check(any(t["side"] == "BUY" for t in r["trades"]), "用例没构造出入场，测不到卖出")
+    check(not [t for t in r["trades"] if t["side"] == "SELL"],
+          "一字跌停日居然成交了卖出（实盘是 Reject，仓位会封在里面）")
+    check(r["open_pos"] is not None, "跌停卖不掉，仓位应当还在，不该凭空消失")
+    check(any("跌停" in b["reason"] for b in r["blocked"]),
+          "跌停拒单没有留痕，等于又变成静默失败")
+
+    # 涨停买不进：再吃一档就超出涨停价
+    why = backtest._limit_block("510050", "上证50ETF华夏", 4.0, "BUY", 4.40, 4.401)
+    check(why and "涨停" in why, "涨停封板买入没被拒")
+    # 20% 品种不能按 10% 判，否则大涨日照样误拒（broker 里踩过同一个坑）
+    why2 = backtest._limit_block("588000", "科创50ETF华夏", 4.0, "BUY", 4.40, 4.401)
+    check(why2 is None, "588000 是 20% 品种，涨停价 4.80，4.40 不该被拒")
+    why3 = backtest._limit_block("510050", "上证50ETF华夏", 4.0, "BUY", 4.00, 4.001)
+    check(why3 is None, "正常价被误拒")
+
+
+@case("回测：标的缺数据要能报出来")
+def t_bt_load_report():
+    rep = {}
+    data = backtest.load_pool(["510300", "999999"], 5, verbose=False,
+                              offline=True, report=rep)
+    check(rep.get("requested") == 2, "report 没回填 requested")
+    check(rep.get("ok") == len(data), "report 的 ok 和实际返回不一致")
+    check(any(c == "999999" for c, _ in (rep.get("failed") or [])),
+          "不存在的代码没进 failed，调用方无从知道池子不完整")
 
 
 @case("无未来函数：决策不看 i 之后的数据")

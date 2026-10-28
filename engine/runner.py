@@ -14,7 +14,7 @@ import os
 import shutil
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import broker      # noqa: E402
@@ -269,7 +269,10 @@ def run(verbose=True, params=None, execute=True, ttl=600):
                     pctx, params, can_sell=can_sell)
                 # decide 看到的时间来自 ticks[k-1]，缺数据时它不知道已经 14:50，
                 # 所以强平要按时间轴再压一次。
-                if tm >= params["force_exit"] and act != "SELL" and can_sell:
+                # 例外：mode="hold" 是要过夜的，这里绝不能平——否则持有型策略
+                # 会退化成「每天买、每天尾盘卖」，那正是被证伪的日内策略。
+                if (params.get("mode") != "hold" and tm >= params["force_exit"]
+                        and act != "SELL" and can_sell):
                     act, reason = "SELL", "尾盘强平"
                 if act == "SELL" and execute:
                     # 隔夜仓的「止盈/止损」是次日开盘跳空触发的，不是日内规则命中。
@@ -292,6 +295,15 @@ def run(verbose=True, params=None, execute=True, ttl=600):
                                         ticks[k]["price"], pos["shares"], dt,
                                         reason=reason,
                                         preclose=data[c]["preclose"])
+                        # 熔断离场后要冷却，否则下一分钟就会立刻买回来——
+                        # 那不是熔断，是白交两次手续费。
+                        if reason.startswith("熔断"):
+                            cd = int(params.get("hold_cooldown_days", 30))
+                            until = (datetime.strptime(day, "%Y-%m-%d")
+                                     + timedelta(days=cd)).strftime("%Y-%m-%d")
+                            acc["hold_paused_until"] = until
+                            events.append({"t": t, "act": "COOLDOWN", "code": c,
+                                           "reason": "熔断冷却至 %s" % until})
                         pos = None
                         ctx["trades"] += 1
                         events.append({"t": t, "act": "SELL", "code": c,
@@ -303,9 +315,22 @@ def run(verbose=True, params=None, execute=True, ttl=600):
                                        "reason": str(e)})
             continue
 
-        # --- 开仓：全池扫描 ---
+        # --- 开仓 ---
+        # mode="hold"：只买指定标的。也不做全池扫描——扫描是日内策略的
+        # 「选最强信号」逻辑，持有型不需要，而且会让别的标的的高波动
+        # 把资金诱走，重新走上被证伪的老路。
+        paused_until = str(acc.get("hold_paused_until") or "")
+        if params.get("mode") == "hold" and paused_until and day < paused_until:
+            continue                    # 熔断冷却期内不建仓
+        if params.get("mode") == "hold":
+            tgt = params.get("hold_target")
+            scan = [tgt] if tgt in data else []
+        else:
+            scan = list(data.keys())
+
         best = None
-        for c, tr in data.items():
+        for c in scan:
+            tr = data[c]
             if t not in idx[c]:
                 continue
             k = idx[c][t]
@@ -322,8 +347,11 @@ def run(verbose=True, params=None, execute=True, ttl=600):
         if best:
             _, c, tr, k, reason = best
             px = tr["ticks"][k]["price"]
-            budget = (acc["cash"] - 5.5) * 0.97
-            shares = int(budget / px / 100) * 100
+            # 留 0.1% 的价格缓冲（防止成交价微小上浮导致超额拒单），
+            # 其余全部买入。原来的 *0.97 是给日内策略留的余量，
+            # 对持有型等于让 3.9% 的资金永久闲置——1 万本金下那是几百块。
+            budget = acc["cash"] - 5.0
+            shares = int(budget / (px * 1.001) / 100) * 100
             if shares >= 100 and execute:
                 try:
                     r = broker.buy(acc, c, tr["name"] or c, px, shares, dt,
@@ -342,7 +370,9 @@ def run(verbose=True, params=None, execute=True, ttl=600):
     # --- 收盘兜底强平 ---
     # 走到这里还有仓位，说明该标的尾盘没有 tick，循环里的强平根本没机会执行。
     # 不补这一步，仓位就会安静地过夜。
-    if execute and pos and acc.get("positions") and tlist:
+    # mode="hold" 本来就要过夜，兜底强平必须关掉——这是第二处，别只改一处。
+    if execute and pos and acc.get("positions") and tlist \
+            and params.get("mode") != "hold":
         can_sell = bool(pos.get("overnight")) or broker.is_t0_etf(pos["code"])
         if tlist[-1][11:16] >= params["force_exit"] and not can_sell:
             # T+1 当天买入的份额，尾盘也确实卖不掉。这是规则，不是故障——
