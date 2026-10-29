@@ -532,7 +532,12 @@ def t_bt_limit_down():
     old = strategy.decide
     strategy.decide = fake_decide
     try:
-        r = backtest.run_backtest(data, dict(strategy.PARAMS), [d1, d2])
+        # 用 daytrade 跑：这条用例测的是「撮合层能不能被跌停挡住」，
+        # 与持有型选哪只票无关。若沿用 PARAMS 的 mode="hold"，
+        # hold_target 会把它锁在 510880 上，数据里没有 510880 就不建仓，
+        # 用例会以「没构造出入场」失败——那测的是另一件事。
+        r = backtest.run_backtest(data, dict(strategy.PARAMS, mode="daytrade"),
+                                  [d1, d2])
     finally:
         strategy.decide = old
 
@@ -562,6 +567,93 @@ def t_bt_load_report():
     check(rep.get("ok") == len(data), "report 的 ok 和实际返回不一致")
     check(any(c == "999999" for c, _ in (rep.get("failed") or [])),
           "不存在的代码没进 failed，调用方无从知道池子不完整")
+
+
+@case("回测：持有型必须只买 hold_target")
+def t_bt_hold_target():
+    """2026-10-29 发现的静默错误：回测买入的不是实盘那只 ETF。
+
+    strategy.decide() 的签名里没有标的，hold 分支只要过了 hold_entry_time
+    就返回 BUY——「买哪只」只能由调用方钉住。runner 钉了（scan=[hold_target]），
+    回测没钉，于是买 data 里第一只：CORE_POOL 顺序下是 510300，而实盘买 510880。
+    两只票三年差 30 个百分点，而回归探针一路报「与基线一致」。
+    """
+    n = len(session_minutes())
+    d1, d2 = "2026-10-19", "2026-10-20"
+
+    def mk(c, px):
+        return {"name": c,
+                "days": {d1: mk_ticks(d1, flat_prices(n, px)),
+                         d2: mk_ticks(d2, flat_prices(n, px))},
+                "preclose": {d1: px, d2: px}, "first_day_no_preclose": d1}
+
+    # 510300 故意排在 dict 前面：旧代码会优先买它
+    data = {"510300": mk("510300", 4.0), "510880": mk("510880", 3.5)}
+    p = dict(strategy.PARAMS, mode="hold", hold_target="510880")
+    r = backtest.run_backtest(data, p, [d1, d2])
+    buys = [t for t in r["trades"] if t["side"] == "BUY"]
+    check(len(buys) == 1, "持有型应当只建仓一次，实际 %d 次" % len(buys))
+    check(buys and buys[0]["code"] == "510880",
+          "买成了 %s，不是 hold_target" % (buys[0]["code"] if buys else "无"))
+
+    # 标的缺数据时必须留痕：以前「没数据」和「今天不买」长得一模一样
+    r2 = backtest.run_backtest({"510300": mk("510300", 4.0)}, p, [d1])
+    check(any(b.get("code") == "510880" for b in r2["blocked"]),
+          "hold_target 缺数据没有留痕，等于静默不建仓")
+
+
+@case("回测：持有型熔断后要冷却，不能当日买回")
+def t_bt_hold_cooldown():
+    """熔断只有配上冷却才是「离场」。
+
+    runner 在卖出后写 acc["hold_paused_until"]，回测没有对应物：
+    熔断当天下一分钟就买回来，回测里的 -25% 变成「多交两次手续费」。
+    """
+    seq = [("2026-10-19", 4.00), ("2026-10-20", 3.64), ("2026-10-21", 3.31),
+           ("2026-10-22", 3.01), ("2026-10-23", 2.74), ("2026-10-26", 2.74)]
+    n = len(session_minutes())
+    days = [d for d, _ in seq]
+    data = {"510880": {"name": "红利ETF",
+                       "days": {d: mk_ticks(d, flat_prices(n, px))
+                                for d, px in seq},
+                       "preclose": {d: px for d, px in seq},
+                       "first_day_no_preclose": days[0]}}
+    p = dict(strategy.PARAMS, mode="hold", hold_target="510880")
+    r = backtest.run_backtest(data, p, days)
+    sells = [t for t in r["trades"] if t["side"] == "SELL"]
+    buys = [t for t in r["trades"] if t["side"] == "BUY"]
+    check(len(sells) == 1 and "熔断" in sells[0]["reason"],
+          "没触发熔断：%s" % [(t["day"], t["reason"]) for t in sells])
+    check(len(buys) == 1 and buys[0]["day"] == days[0],
+          "熔断后在冷却期内又建仓了：%s" % [(t["day"]) for t in buys])
+
+
+@case("持有型：09:35 就该建仓，不该被 22 根预热门槛推到 09:52")
+def t_hold_entry_time():
+    """22 根预热门槛是给日内指标用的（vol_ratio 要 20 根）。
+
+    它套在持有型头上没有任何理由，后果是 hold_entry_time="09:35" 实际变成
+    09:52——参数写的和实际做的不一样，而且永远不会报错。
+    """
+    with sandbox():
+        day = today()
+        n = len(session_minutes())
+        px = flat_prices(n, 3.5)
+        ticks = mk_ticks(day, px)
+        q = {"510880": mk_quote("510880", 3.5, 3.5)}
+        old = install_fake_market(
+            {"510880": {"ticks": ticks, "preclose": 3.5, "name": "红利ETF"}}, q)
+        try:
+            runner.run(verbose=False, execute=True,
+                       params=dict(strategy.PARAMS, mode="hold",
+                                   hold_target="510880"))
+            rows = doctor._read_trades()
+        finally:
+            restore_market(old)
+        buys = [r for r in rows if r["side"] == "BUY"]
+        check(len(buys) == 1, "应当建仓一次，实际 %d 次" % len(buys))
+        hm = buys[0]["datetime"][11:16] if buys else "无"
+        check("09:35" <= hm <= "09:40", "建仓时间 %s，偏离 hold_entry_time" % hm)
 
 
 @case("盘中换策略：必须拒绝重放，不许用早盘价格执行新决定")

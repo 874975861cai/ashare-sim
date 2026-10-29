@@ -8,6 +8,7 @@
 import os
 import sys
 from collections import defaultdict
+from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import broker       # noqa: E402
@@ -160,6 +161,23 @@ def run_backtest(data, params, days, capital=10000.0, verbose=False):
 
     seen_blocks = set()
 
+    # ------------------------------------------------------------------
+    # 持有型（mode="hold"）的两处对齐，2026-10-29 补。
+    #
+    # 1) 买哪只必须在这里钉住。strategy.decide() 的签名里没有「标的」，
+    #    它只回答「该不该买」——hold 分支只要过了 hold_entry_time 就返回 BUY。
+    #    回测因此会买 data 里的第一只（CORE_POOL 顺序 → 510300），而实盘
+    #    runner 明确买 PARAMS["hold_target"]（510880）。两只 ETF 的三年收益
+    #    差 30 个百分点，回归探针却一直报「与基线一致」：它量的是另一只票。
+    #
+    # 2) 熔断冷却。runner 在 broker.sell 之后写 acc["hold_paused_until"]，
+    #    回测没有对应物，于是熔断当天就立刻买回来——回测里的 -25% 熔断
+    #    实际上没起到「离场」作用，只是多交了两次手续费。
+    # ------------------------------------------------------------------
+    hold_tgt = (str(params.get("hold_target") or "")
+                if params.get("mode") == "hold" else "")
+    pause_until = ""      # 熔断冷却截止日（含），语义同 runner 的 hold_paused_until
+
     # 大盘代理：实盘 runner 用 510300，池里没有就退化为首个标的
     mkt = "510300" if "510300" in data else (next(iter(data)) if data else None)
     if verbose and mkt != "510300":
@@ -245,16 +263,39 @@ def run_backtest(data, params, days, capital=10000.0, verbose=False):
                                        "pnl": pnl, "reason": reason})
                         pos = None
                         ctx["trades"] += 1
+                        # 熔断离场后要冷却，否则下一分钟就买回来（同 runner）
+                        if reason.startswith("熔断"):
+                            cd = int(params.get("hold_cooldown_days", 30))
+                            pause_until = (datetime.strptime(day, "%Y-%m-%d")
+                                           + timedelta(days=cd)).strftime("%Y-%m-%d")
                 continue
 
             # 空仓：全池扫描，选偏离最深的
+            # 熔断冷却期内不建仓（date 字符串比较，与 runner 的 day < until 同义）
+            if pause_until and day < pause_until:
+                continue
+            if hold_tgt and hold_tgt not in data:
+                # 持有型标的缺数据 = 今日不建仓。以前这里什么都不做，
+                # 「标的没数据」和「策略决定不买」看起来一模一样。
+                note_block(day, hold_tgt, "BUY", t if tlist else "",
+                           "持有型标的缺数据，本日不建仓", tag="hold_target")
+                continue
             best = None
             for c, v in data.items():
+                if hold_tgt and c != hold_tgt:
+                    continue
                 if day not in v["days"] or t not in idxmap[c]:
                     continue
                 ticks = v["days"][day]
                 k = idxmap[c][t]
-                if k < 22:
+                # k=0 → decide 的 ticks[k-1] 是 ticks[-1]，即当日最后一根。
+                # 回放里这就是未来数据（与 runner 同一处坑，两边都要挡）。
+                if k < 1:
+                    continue
+                # 22 根预热门槛是给日内指标（vol_ratio 要 20 根）用的。
+                # 持有型不读任何指标，套用它等于把 hold_entry_time=09:35
+                # 悄悄推到 09:52——参数写的和实际做的不一样。
+                if params.get("mode") != "hold" and k < 22:
                     continue
                 cctx = dict(ctx)
                 cctx["preclose"] = v["preclose"][day]
@@ -277,9 +318,11 @@ def run_backtest(data, params, days, capital=10000.0, verbose=False):
                     # （只取最优一只，不换次优），回测保持同样的行为。
                     note_block(day, c, "BUY", t, why)
                     continue
-                # 用 97% 资金，整百份
-                budget = (cash - 5.5) * 0.97
-                shares = int(budget / px / 100) * 100
+                # 与 runner 同一口径：留 5 元手续费 + 0.1% 价格缓冲，其余全部买入。
+                # 旧的 (cash-5.5)*0.97 是给日内策略留的余量，在持有型下让 3% 资金
+                # 永久闲置，回测的仓位因此系统性小于实盘。
+                budget = cash - 5.0
+                shares = int(budget / (px * 1.001) / 100) * 100
                 if shares >= 100:
                     amt = px * shares
                     fee = broker.calc_fee(c, "BUY", amt)

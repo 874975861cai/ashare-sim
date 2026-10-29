@@ -76,6 +76,34 @@ def _read_trades():
         return [r for r in csv.DictReader(f) if r.get("seq")]
 
 
+def _git(*args, timeout=30):
+    """跑一条 git 命令。失败一律返回字符串，不抛异常——体检不能被网络搞崩。"""
+    try:
+        r = subprocess.run(["git"] + list(args), cwd=ROOT, capture_output=True,
+                           text=True, encoding="utf-8", errors="replace",
+                           timeout=timeout)
+        return r.returncode, (r.stdout or "").strip(), (r.stderr or "").strip()
+    except (OSError, subprocess.SubprocessError) as e:
+        return 127, "", str(e)
+
+
+def sync_decision(behind, ahead, conflicts):
+    """决定「本地副本要不要从云端拉一次」。
+
+    纯函数，方便自测。返回 (动作, 说明)，动作为：
+        skip   本地已最新，什么都不用做
+        pull   可以快进合并
+        manual 分叉 / 会覆盖本地未提交改动，交给人判断
+    """
+    if behind <= 0:
+        return "skip", "本地已是最新"
+    if ahead > 0:
+        return "manual", "本地有 %d 个未推送提交，与云端分叉，不自动合并" % ahead
+    if conflicts:
+        return "manual", "本地未提交改动会与云端冲突：%s" % "、".join(sorted(conflicts)[:3])
+    return "pull", "本地副本落后云端 %d 个提交" % behind
+
+
 # ==========================================================================
 # 账本重放：纯函数，方便自测
 # ==========================================================================
@@ -243,6 +271,24 @@ def selftest_replay():
     _, _, _, probs2 = replay(bad, 10000.0)
     if not any("现金链断裂" in m for _, m in probs2):
         fails.append("篡改现金未被发现")
+    fails += selftest_sync()
+    return fails
+
+
+def selftest_sync():
+    """同步决策是纯逻辑，最容易写反（例如把「分叉」当成能快进）。
+    这里把四种情形都钉住，防止哪天改坏了变成自动覆盖别人的提交。"""
+    fails = []
+    cases = [
+        ((0, 0, ()), "skip", "本地已最新"),
+        ((3, 0, ()), "pull", "落后 3 个提交且无冲突，应允许快进"),
+        ((3, 1, ()), "manual", "本地有未推送提交，不能自动合并"),
+        ((3, 0, ("state/equity.csv",)), "manual", "会覆盖本地未提交改动，不能自动合并"),
+    ]
+    for (args, want, why) in cases:
+        got, _ = sync_decision(*args)
+        if got != want:
+            fails.append("同步决策错误（%s）：得到 %s，应为 %s" % (why, got, want))
     return fails
 
 
@@ -375,13 +421,129 @@ def _regen_page():
 
 
 def _ledger_last_day():
-    """账本里最后一行净值是哪一天（内容信号，不受 git pull 影响）。"""
+    """账本里最后一行净值是哪一天（读文件内容，不受本地副本新旧影响）。"""
     try:
         with open(broker.EQUITY_FILE, "r", encoding="utf-8-sig", newline="") as f:
             rows = [r for r in csv.DictReader(f) if r.get("date")]
         return rows[-1]["date"] if rows else ""
     except (OSError, csv.Error):
         return ""
+
+
+def _sync_local_ledger():
+    """本地只是账本的一个副本，云端跑完才会提交。
+
+    所以「盘中缺今日净值行」有两种可能：云端真的没跑，或者云端跑了、
+    本地没拉。分不清就会天天误报「云端自动化没跑」——2026-10-29 就踩过。
+    这里先 fetch，再按 sync_decision 决定能不能快进合并。
+    返回 (是否已同步, 补充说明)。
+    """
+    if not DO_FIX:
+        return False, "；--no-fix，未尝试同步本地副本"
+    rc, _, _ = _git("rev-parse", "--is-inside-work-tree")
+    if rc != 0:
+        return False, "；不是 git 工作区，无法判断云端是否记账"
+
+    rc, _, err = _git("fetch", "--quiet", "origin", "main", timeout=45)
+    if rc != 0:
+        first = (err.splitlines() or ["网络异常"])[0][:60]
+        return False, "；拉取云端失败：%s" % first
+
+    _, behind_s, _ = _git("rev-list", "--count", "HEAD..origin/main")
+    _, ahead_s, _ = _git("rev-list", "--count", "origin/main..HEAD")
+    try:
+        behind, ahead = int(behind_s or 0), int(ahead_s or 0)
+    except ValueError:
+        return False, "；无法解析与远端的差异"
+
+    # 只有「合并会覆盖到的、本地又改过的文件」才算冲突
+    _, dirty_s, _ = _git("diff", "--name-only")
+    _, incoming_s, _ = _git("diff", "--name-only", "HEAD", "origin/main")
+    dirty = set(x for x in dirty_s.splitlines() if x.strip())
+    conflict = dirty & set(x for x in incoming_s.splitlines() if x.strip())
+
+    action, msg = sync_decision(behind, ahead, conflict)
+    if action == "skip":
+        return False, "；云端也没有今日提交（本地已同步到最新）"
+    if action == "manual":
+        return False, "；云端已提交 %d 个版本待同步，但%s" % (behind, msg)
+
+    rc, _, err = _git("merge", "--ff-only", "origin/main")
+    if rc != 0:
+        first = (err.splitlines() or ["未知错误"])[0][:60]
+        return False, "；云端有 %d 个提交待同步，快进合并失败：%s" % (behind, first)
+    return True, "%s，现已快进合并" % msg
+
+
+def _num(s):
+    """把 "¥9,919.50" 这类展示串还原成 float；失败返回 None。"""
+    try:
+        return float(str(s).replace("¥", "").replace(",", "").strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def check_mirror():
+    """本地只是只读镜像：它「看起来没成交」，不等于云端没成交。
+
+    2026-10-29 踩过这个坑：github.com:443 一整天反复超时，`git fetch` 拉不动，
+    本地 state/account.json 停在「空仓 / cash 9919.50」，于是 doctor 17 项全绿；
+    而同一时刻线上看板是 n_pos=1 / cash 54.50 —— 云端早就把 510880 买进去了。
+    差一点把「本地镜像过期」写成「云端自动化没跑」。
+
+    /api/state 是本机唯一一条不依赖 github 的真实来源，用它做交叉核对：
+    cash / 持仓数 / 已平笔数三项都对上，才算「镜像与线上一致」。
+    对不上时不能说「账本错了」——账本在云端，错的只可能是本地这份副本。
+    """
+    try:
+        import urllib.request
+        import push_cloud
+    except Exception:  # noqa: BLE001
+        add(WARN, "账本", "镜像同步", "无法导入 push_cloud，跳过镜像核对")
+        return
+
+    now = datetime.now()
+    try:
+        with urllib.request.urlopen(push_cloud.URL + "/api/state", timeout=6) as r:
+            st = json.loads(r.read().decode("utf-8"))
+    except Exception as e:  # noqa: BLE001
+        # 交易时段的「核对不了」本身就是风险：这段时间正是需要知道
+        # 本地这份账是不是今天的时候。非交易时段不吵。
+        hm = now.strftime("%H:%M")
+        if now.weekday() < 5 and "09:00" <= hm <= "16:00":
+            add(WARN, "账本", "镜像同步",
+                "线上看板不可达（%s），无法确认本地镜像是不是最新的"
+                % type(e).__name__)
+        else:
+            add(OK, "账本", "镜像同步", "线上看板不可达，非交易时段不核对")
+        return
+
+    import broker
+    acc = broker.load_account()
+    local_cash = float(acc.get("cash") or 0)
+    local_pos = len(acc.get("positions") or {})
+    local_sell = len([r for r in _read_trades() if r.get("side") == "SELL"])
+
+    r_cash = _num(st.get("cash"))
+    r_pos = st.get("n_pos")
+    r_sell = st.get("n_trades")
+    if r_cash is None or r_pos is None or r_sell is None:
+        add(WARN, "账本", "镜像同步", "线上看板返回字段不全，无法核对")
+        return
+
+    ok = (abs(r_cash - local_cash) <= 0.011 and int(r_pos) == local_pos
+          and int(r_sell) == local_sell)
+    if ok:
+        add(OK, "账本", "镜像同步",
+            "与线上看板一致（cash %.2f / 持仓 %d / 已平 %d 笔）"
+            % (r_cash, int(r_pos), int(r_sell)))
+        return
+
+    add(WARN, "账本", "镜像同步",
+        "本地镜像与线上不一致：线上 cash %.2f / 持仓 %d / 已平 %d 笔，"
+        "本地 cash %.2f / 持仓 %d / 已平 %d 笔。账本在云端，本地这份只是副本，"
+        "先同步再复盘"
+        % (r_cash, int(r_pos), int(r_sell), local_cash, local_pos, local_sell))
 
 
 def check_heartbeat():
@@ -416,9 +578,15 @@ def check_heartbeat():
     # 10:00 之前不判：云端 cron 有 5-20 分钟抖动，太早问等于催
     active = now.weekday() < 5 and "10:00" <= hm <= "15:30"
     if active:
+        # 缺今日净值行时，先分清「云端没跑」还是「本地没拉」，别冤枉云端
+        synced, detail = _sync_local_ledger()
+        if synced and _ledger_last_day() == today:
+            add(FIX, "运行时", "任务心跳",
+                "本地副本过期，已从云端同步并写入今日账本%s" % note)
+            return
         add(WARN, "运行时", "任务心跳",
-            "盘中但今天账本还没有净值行（最后 %s），云端自动化可能没跑"
-            % (led_day or "无"))
+            "盘中但今天账本还没有净值行（最后 %s），云端自动化可能没跑%s"
+            % (led_day or "无", detail))
         return
 
     if hb_dt is not None:
@@ -985,6 +1153,7 @@ def main():
     port = check_service()
     check_page(port)
     check_heartbeat()
+    check_mirror()
     check_ledger()
     check_py_compile()
     check_js()

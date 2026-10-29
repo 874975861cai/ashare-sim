@@ -152,11 +152,13 @@ def _heartbeat(day, snap, events):
         pass
 
 
-def _warn_overnight(acc, day, verbose=True):
+def _warn_overnight(acc, day, verbose=True, hold_mode=False):
     """检测前一交易日遗留的仓位。
 
-    策略是日内的，正常收盘后不该有持仓。若存在，说明收盘定稿任务没执行
-    或尾盘强平没生效——这是执行问题，不是策略问题，必须显式告警。
+    日内策略收盘后不该有持仓，有就是执行问题，必须显式告警。
+    但 mode="hold" 本来就要过夜——这时候再喊「违反日内平仓原则」，
+    等于把「正常」和「故障」揉成同一句话：云端每 5 分钟刷一条，
+    真的漏平仓那天反而没人看。所以持有型换成中性措辞。
     """
     stale = []
     for code, pos in (acc.get("positions") or {}).items():
@@ -165,6 +167,11 @@ def _warn_overnight(acc, day, verbose=True):
                 stale.append((code, pos.get("name") or code,
                               lot.get("shares", 0), lot.get("date")))
     if stale and verbose:
+        if hold_mode:
+            print("  [持仓] 持有型策略，过夜仓属正常：")
+            for code, name, sh, d in stale:
+                print(f"    {code} {name} {sh} 份，建仓日 {d}")
+            return stale
         print("  [警告] 存在过夜仓位（违反日内平仓原则）：")
         for code, name, sh, d in stale:
             print(f"    {code} {name} {sh} 股，建仓日 {d}")
@@ -202,7 +209,7 @@ def run(verbose=True, params=None, execute=True, ttl=600):
     acc = broker.load_account()
     now = datetime.now()
     day = now.strftime("%Y-%m-%d")
-    _warn_overnight(acc, day, verbose)
+    _warn_overnight(acc, day, verbose, hold_mode=params.get("mode") == "hold")
 
     quotes = market.fetch_quotes(strategy.CORE_POOL)
     pool = strategy.validate_pool(quotes, params)
@@ -304,8 +311,19 @@ def run(verbose=True, params=None, execute=True, ttl=600):
                    "shares": broker.position_shares(acc["positions"][c0]),
                    "overnight": True}
             if verbose:
-                print(f"  [续管] 开盘持仓 {c0} {pos['shares']} 份 "
-                      f"成本 {pos['entry']:.3f}，按日内规则平掉")
+                if params.get("mode") == "hold":
+                    print(f"  [续管] 开盘持仓 {c0} {pos['shares']} 份 "
+                          f"成本 {pos['entry']:.3f}，持有型继续持有")
+                else:
+                    print(f"  [续管] 开盘持仓 {c0} {pos['shares']} 份 "
+                          f"成本 {pos['entry']:.3f}，按日内规则平掉")
+
+    # 持有型只买一只。标的没数据时今日不会有任何成交——这句必须说出来，
+    # 否则「标的缺数据」和「策略今天不买」在日志里长得一模一样。
+    hold_tgt = (str(params.get("hold_target") or "")
+                if params.get("mode") == "hold" else "")
+    if hold_tgt and hold_tgt not in data and verbose:
+        print("  [警告] 持有标的 %s 今天没有分时数据，本日不会建仓" % hold_tgt)
 
     for i, t in enumerate(tlist):
         tm = t[11:16]
@@ -392,8 +410,7 @@ def run(verbose=True, params=None, execute=True, ttl=600):
         if params.get("mode") == "hold" and paused_until and day < paused_until:
             continue                    # 熔断冷却期内不建仓
         if params.get("mode") == "hold":
-            tgt = params.get("hold_target")
-            scan = [tgt] if tgt in data else []
+            scan = [hold_tgt] if hold_tgt in data else []
         else:
             scan = list(data.keys())
 
@@ -403,7 +420,13 @@ def run(verbose=True, params=None, execute=True, ttl=600):
             if t not in idx[c]:
                 continue
             k = idx[c][t]
-            if k < 22:
+            # k=0 时 decide 拿到的是 ticks[-1]（当日最后一根）——回放时那就是未来数据，
+            # 09:30 会以「15:00 的时间」直接建仓。必须先挡住空索引。
+            if k < 1:
+                continue
+            # 22 根是日内指标的预热门槛（vol_ratio 要 20 根）。持有型不读指标，
+            # 套用它会把 hold_entry_time=09:35 悄悄推到 09:52。
+            if params.get("mode") != "hold" and k < 22:
                 continue
             cctx = dict(ctx)
             cctx["preclose"] = tr["preclose"] or tr["ticks"][0]["price"]
