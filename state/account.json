@@ -10,9 +10,23 @@
       "transfer_fee": 1e-05
     }
   },
-  "cash": 9919.5,
-  "positions": {},
-  "trade_seq": 10,
+  "cash": 54.5,
+  "positions": {
+    "510880": {
+      "name": "红利ETF华泰柏瑞",
+      "lots": [
+        {
+          "date": "2026-10-29",
+          "shares": 2900,
+          "price": 3.4,
+          "fee": 5.0,
+          "time": "09:52"
+        }
+      ],
+      "realized": 0.0
+    }
+  },
+  "trade_seq": 11,
   "today": "2026-10-29",
   "peak_equity": 10000.0
 }
