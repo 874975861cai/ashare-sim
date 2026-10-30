@@ -107,7 +107,10 @@ def main(argv):
         return 0
 
     targets = files if args.all else args.files
-    targets = [t.replace("\\", "/").lstrip("./") for t in targets]
+    # 只去掉 "./" 前缀。原来写 lstrip("./")，它按字符集剥，会把 .github/ 开头的
+    # 点一起吃掉，于是带点目录永远报「git 里没有这个文件」（2026-10-30 踩到）。
+    targets = [t.replace("\\", "/") for t in targets]
+    targets = [t[2:] if t.startswith("./") else t for t in targets]
     if not targets:
         print("没有要推送的文件。")
         return 0

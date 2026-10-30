@@ -127,8 +127,12 @@ jobs:
           # 只提交「账本真相」。净值表盘中每 5 分钟都会随行情变动，
           # 若照单全收，一天就是 60 多次提交，历史会被噪音淹掉。
           # 规则：有新成交就提交；没有新成交，则只在收盘后提交一次。
+          # 只认流水当成交信号。以前把 account.json 也算进来，但它每次运行都会
+          # 刷新 today / peak_equity，于是没成交也判成「有新成交」：2026-10-30
+          # 09:46 那条「成交记账」改的只是 account.json + equity.csv，流水一行没动。
+          # 顺带把盘中净值表也一起提交了，正是上面说要避免的噪音。
           new_trade=0
-          git diff --quiet -- state/trades.csv state/account.json || new_trade=1
+          git diff --quiet -- state/trades.csv || new_trade=1
 
           after_close=$(python -c "from datetime import datetime,timezone,timedelta as d;print(1 if datetime.now(timezone(d(hours=8))).strftime('%H:%M')>='15:00' else 0)")
 
