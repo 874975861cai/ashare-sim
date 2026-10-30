@@ -272,6 +272,8 @@ def selftest_replay():
     if not any("现金链断裂" in m for _, m in probs2):
         fails.append("篡改现金未被发现")
     fails += selftest_sync()
+    fails += selftest_overnight()
+    fails += selftest_watch_window()
     return fails
 
 
@@ -289,6 +291,56 @@ def selftest_sync():
         got, _ = sync_decision(*args)
         if got != want:
             fails.append("同步决策错误（%s）：得到 %s，应为 %s" % (why, got, want))
+    return fails
+
+
+def selftest_overnight():
+    """过夜仓判定必须跟着策略模式走。
+
+    2026-10-28 切持有型后，旧的日内判定每天收盘都对一笔正常持仓报 WARN
+    （2026-10-30 复现）。这里把四种情形钉死：既防回退成天天误报，
+    也防有人图省事改成「有仓一律不报」。
+    """
+    fails = []
+    one = {"510880": {"lots": [{"date": "2026-10-29", "shares": 2900, "price": 3.4}]}}
+    cases = [
+        (one, "2026-10-30", 16, "hold", "510880", OK,
+         "持有型过夜属设计内，应以 OK 说明，不该报警"),
+        (one, "2026-10-30", 16, "daytrade", "", WARN,
+         "日内策略过夜必须报警"),
+        (one, "2026-10-30", 10, "daytrade", "", None,
+         "收盘前持仓是当天建的，不算过夜"),
+        ({"510300": {"lots": [{"date": "2026-10-29"}]}}, "2026-10-30", 16,
+         "hold", "510880", WARN,
+         "持有型却持有非目标标的，必须报警"),
+        ({}, "2026-10-30", 16, "hold", "510880", None, "空仓不该报警"),
+    ]
+    for positions, d, h, mode, tgt, want, why in cases:
+        got, _ = overnight_judgment(positions, d, h, mode, tgt)
+        if got != want:
+            fails.append("过夜仓判定错误（%s）：得到 %s，应为 %s" % (why, got, want))
+    return fails
+
+
+def selftest_watch_window():
+    """对账窗口的边界。
+
+    上界从 15:30 放宽到 16:30 是为了补上收盘后那段盲区（2026-10-30 踩过），
+    但放宽过头会让晚上十点还在报「云端没跑」，同样会把真问题淹掉。
+    """
+    fails = []
+    cases = [
+        (4, "09:59", False, "开盘前太早，cron 抖动还没落地"),
+        (4, "10:00", True, "10:00 起该问了"),
+        (4, "15:30", True, "收盘前后都要盯着"),
+        (4, "16:30", True, "收盘后仍在对账窗口内"),
+        (4, "16:31", False, "太晚，别在夜里刷存在感"),
+        (5, "10:00", False, "周六不判"),
+        (6, "15:00", False, "周日不判"),
+    ]
+    for wd, hm, want, why in cases:
+        if ledger_watch_active(wd, hm) != want:
+            fails.append("对账窗口错误（%s）：%s@%s" % (why, wd, hm))
     return fails
 
 
@@ -546,6 +598,19 @@ def check_mirror():
         % (r_cash, int(r_pos), int(r_sell), local_cash, local_pos, local_sell))
 
 
+def ledger_watch_active(weekday, hm):
+    """现在该不该拿「今天的净值行」去追究自动化。纯函数，方便自测。
+
+    weekday 用 datetime.weekday()（周一=0）；hm 是 "HH:MM"。
+
+    下界 10:00：云端 cron 有 5-20 分钟抖动，太早问等于催。
+    上界 16:30：收盘后才是对账的时刻，15:30 就撒手会把「本地落后」漏成绿灯。
+    """
+    if weekday >= 5:
+        return False
+    return "10:00" <= hm <= "16:30"
+
+
 def check_heartbeat():
     """判断「自动化还在跑吗」。
 
@@ -575,8 +640,12 @@ def check_heartbeat():
         return
 
     hm = now.strftime("%H:%M")
-    # 10:00 之前不判：云端 cron 有 5-20 分钟抖动，太早问等于催
-    active = now.weekday() < 5 and "10:00" <= hm <= "15:30"
+    # 收盘后也要判。15:30 就撒手的话，最该确认「今天到底定稿没有」的那半小时
+    # 反而没人看：2026-10-30 收盘后本地副本落后云端两个提交、净值表停在
+    # 10-29，体检照样全绿。云端最后一轮派工在 15:55 左右，窗口放到 16:30
+    # 给提交留余量；再晚就没意义了，那时人已经不在电脑前。
+    # 10:00 之前不判：云端 cron 有 5-20 分钟抖动，太早问等于催。
+    active = ledger_watch_active(now.weekday(), hm)
     if active:
         # 缺今日净值行时，先分清「云端没跑」还是「本地没拉」，别冤枉云端
         synced, detail = _sync_local_ledger()
@@ -584,9 +653,10 @@ def check_heartbeat():
             add(FIX, "运行时", "任务心跳",
                 "本地副本过期，已从云端同步并写入今日账本%s" % note)
             return
+        seg = "盘中" if hm <= "15:30" else "收盘后"
         add(WARN, "运行时", "任务心跳",
-            "盘中但今天账本还没有净值行（最后 %s），云端自动化可能没跑%s"
-            % (led_day or "无", detail))
+            "%s但今天账本还没有净值行（最后 %s），云端自动化可能没跑%s"
+            % (seg, led_day or "无", detail))
         return
 
     if hb_dt is not None:
@@ -596,6 +666,38 @@ def check_heartbeat():
             return
     add(OK, "运行时", "任务心跳",
         "非盘中时段，不判漏跑（账本最后净值行 %s）%s" % (led_day or "无", note))
+
+
+def _strategy_mode():
+    """读当前策略模式。导入失败退回日内口径——宁可多报，不可漏报。"""
+    try:
+        import strategy
+        return (str(strategy.PARAMS.get("mode") or "daytrade"),
+                str(strategy.PARAMS.get("hold_target") or ""))
+    except Exception:  # noqa: BLE001
+        return "daytrade", ""
+
+
+def overnight_judgment(positions, today, hour, mode="daytrade", hold_target=""):
+    """判断「收盘后还持有前一日的仓位」是故障还是设计。纯函数，方便自测。
+
+    日内策略收盘必须清空，有仓就是执行问题；持有型（mode="hold"）本来
+    就要过夜，这时再喊「违反日内平仓」等于把正常和故障揉成同一句话，
+    喊多了真漏平仓那天反而没人看。持有型真正该报的是「持有非目标标的」，
+    那说明账本和策略已经不一致。
+    """
+    stale = sorted({(c, str(l.get("date"))) for c, p in (positions or {}).items()
+                    for l in (p.get("lots") or []) if str(l.get("date")) != today})
+    if not stale or hour < 15:          # 收盘前的仓是当天建的，不算过夜
+        return None, ""
+    shown = "、".join("%s@%s" % x for x in stale[:3])
+    if str(mode) == "hold":
+        off = sorted({c for c, _ in stale if hold_target and c != hold_target})
+        if off:
+            return WARN, "持有型目标 %s，却持有 %s（账本与策略口径不一致）" % (
+                hold_target, "、".join(off))
+        return OK, "%s 为持有型持仓（mode=hold），过夜属设计内" % shown
+    return WARN, "收盘后仍有前一日建仓：%s（日内策略应清空）" % shown
 
 
 # ==========================================================================
@@ -669,13 +771,15 @@ def check_ledger():
         add(OK, "账本", "持仓上限", "1 / 1")
 
     # ---- 过夜仓 ----
-    today = datetime.now().strftime("%Y-%m-%d")
-    stale = [(c, l.get("date")) for c, p in positions.items()
-             for l in (p.get("lots") or []) if l.get("date") != today]
-    if stale and datetime.now().hour >= 15:
-        add(WARN, "账本", "过夜仓",
-            "收盘后仍有前一日建仓：%s（日内策略应清空）" %
-            "、".join("%s@%s" % x for x in stale[:3]))
+    # 口径必须跟着策略走：2026-10-28 起 mode="hold"，过夜是设计目标。
+    # 旧判定只认日内口径，于是每天收盘都对一笔正常持仓喊「应清空」——
+    # runner._warn_overnight 早就区分 hold_mode 了，检查器却没跟上（2026-10-30 修）。
+    mode, hold_target = _strategy_mode()
+    now = datetime.now()
+    lvl, msg = overnight_judgment(positions, now.strftime("%Y-%m-%d"),
+                                  now.hour, mode, hold_target)
+    if lvl:
+        add(lvl, "账本", "过夜仓", msg)
 
     # ---- 净值表 ----
     eqf = broker.EQUITY_FILE
