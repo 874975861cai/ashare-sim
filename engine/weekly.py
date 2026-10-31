@@ -275,6 +275,27 @@ def try_backtest(ndays=5):
         return None
 
     base = dict(strategy.PARAMS)
+
+    # 2026-10-30 修：mode="hold" 下这张表结构上不可能有信息量。
+    #   6 组候选改的全是 dev_enter / stop_loss / take_profit / max_hold_min，
+    #   而 strategy.decide 的 hold 分支一个都不读 → 结果必然恒等。
+    #   10-30 那期就是这样：6 行全是 -1.93% / 0 笔，看着像「参数无效」，
+    #   实际是「参数没被测试」。那个 0 笔也不是没交易，是只买不卖（无 SELL 计入）。
+    #   把恒等表当评审依据，比不跑回测更危险——它给了一个虚假的「已检验」。
+    #   持有型的参数只有 hold_target / hold_stop / hold_entry_time，
+    #   而它们的效果必须用多年日线看（engine/riskstudy.py），不是 5~12 天分钟线。
+    if str(base.get("mode") or "daytrade") == "hold":
+        return {
+            "days": days, "rows": [], "note":
+            "当前策略为持有型（mode=hold，标的 %s），本表 6 组候选改的都是"
+            "**已停用的日内参数**（dev_enter / 止盈 / 止损 / 持仓时长），"
+            "hold 分支根本不读取，结果恒等属预期，**不是参数无效，是参数没被测试**。\n>\n"
+            "> 持有型真正可调的只有 hold_target / hold_stop / hold_entry_time，"
+            "而且它们的优劣要用多年日线看，%d 天的分钟线不足以判断。"
+            "请用 `python engine/riskstudy.py` 做长区间检验。"
+            % (base.get("hold_target") or "-", len(days)),
+        }
+
     variants = [
         ("当前参数", {}),
         ("入场放宽 0.7%", {"dev_enter": 0.0070}),
@@ -346,6 +367,16 @@ def render_markdown(summary, gate_info, issues, bt, acc, audit=None):
         verdict += " 无规则偏离。"
     L.append("")
     L.append(verdict)
+    if not gate_info["ok"] and str(strategy.PARAMS.get("mode") or "") == "hold":
+        # 2026-10-30：门槛是按日内策略（约 0.6 笔/日）定的。持有型一年成交
+        # 1~2 笔，「20 笔」等于几十年，这个门槛在 hold 模式下永远达不到，
+        # 也就意味着「永远不评审」——那不是谨慎，是把评审机制废掉了。
+        # 这里不擅自改门槛（改门槛=改评审标准的宽松度，得人来定），只把话说清。
+        L.append("")
+        L.append("> ⚠️ 门槛（%d 笔）是按日内策略定的；当前是持有型（mode=hold），"
+                 "实际频率约 1 笔/季度，「%d 笔」在结构上不可达。"
+                 "门槛本身需要人工重新定义，本脚本不擅自放宽。"
+                 % (MIN_TRADES, MIN_TRADES))
     L.append("")
 
     # ---- 实测 ----
@@ -386,6 +417,12 @@ def render_markdown(summary, gate_info, issues, bt, acc, audit=None):
     if bt is None:
         L.append("本地缓存不足（需 ≥3 个交易日分钟数据），本期跳过回测。"
                  "可跑 `python engine/warmup.py` 补数据。")
+    elif not bt.get("rows"):
+        # 结构上不适用（如 mode=hold），给原因而不是一张恒等表
+        L.append("样本：%d 个交易日（%s ~ %s）"
+                 % (len(bt["days"]), bt["days"][0], bt["days"][-1]))
+        L.append("")
+        L.append("> %s" % (bt.get("note") or "本表不适用"))
     else:
         L.append("样本：%d 个交易日（%s ~ %s）"
                  % (len(bt["days"]), bt["days"][0], bt["days"][-1]))
@@ -422,9 +459,25 @@ def render_markdown(summary, gate_info, issues, bt, acc, audit=None):
                         r["avg_ret"], r["amp"]))
         L.append("")
         v = audit_verdict(audit)
-        if v:
+        if str(strategy.PARAMS.get("mode") or "") == "hold":
+            # 体检算的是「日内信号段」的期望，持有型根本不产生日内信号。
+            # 保留表格是为了对照池子质地，但绝不能让它输出「剔除某只」的结论
+            # ——持有型只买一只，剔除清单对它没有操作意义。
+            # （2026-10-30：原来这里直接复用 audit_verdict，末尾那句
+            #  「下次评审优先考虑剔除」在 hold 模式下是误导性指令。）
+            rows = audit["rows"]
+            good = [r for r in rows if r["avg_ret"] > 0.05]
+            tgt = next((r for r in rows
+                        if r["code"] == str(strategy.PARAMS.get("hold_target"))), None)
+            L.append("**读数**：当前为持有型（mode=hold），本表**不用于选股决策**，"
+                     "仅作池子质地参照——正期望 %d / %d 只；持有标的 %s 的日内"
+                     "净期望 %s（此处为负也正常：持有型赚的是多年趋势，不是日内回归）。"
+                     % (len(good), len(rows),
+                        (tgt or {}).get("name", "-"),
+                        "%+.2f%%" % tgt["avg_ret"] if tgt else "无数据"))
+        elif v:
             L.append("**读数**：%s" % v)
-            L.append("")
+        L.append("")
         L.append("> 注意：净期望是「每个信号段都入场」的理想值，实际一次只能持一仓，"
                  "真实收益会低于此表。这张表用来**比较标的之间的相对质量**，不是预测收益。")
     else:
