@@ -958,5 +958,104 @@ def t_cloud_strategy_changed_code():
     check(code_holiday == 2, "非交易日应仍是 2，实际 %s" % code_holiday)
 
 
+@case("同步脚本：缺文件不能报「一致」，写入默认被锁")
+def t_sync_cloud_states():
+    """三条语义，每一条都对应一次「安静的错结论」。
+
+    1. 本地少了 trades.csv，云端也没有 → 旧代码算出 None == None = 「无差异」→
+       打印「一致」。账本根本没在同步，而指令是「什么都不用做」。
+    2. 云端副本目录不在 → 旧代码也打印 NEED_PUBLISH=0，和「一致」长得一样。
+       10-31 时那个副本停在 10-28（空仓）却天天报 0。
+    3. 写入方向在新拓扑下是反的（本地是只读镜像），必须默认拒绝。
+    """
+    import io
+    from contextlib import redirect_stdout
+    import sync_cloud
+
+    tmp = tempfile.mkdtemp(prefix="tsim_sc_")
+    src_state = os.path.join(tmp, "src_state")
+    src_eng = os.path.join(tmp, "src_engine")
+    dst_state = os.path.join(tmp, "dst_state")
+    dst_eng = os.path.join(tmp, "dst_engine")
+    for d in (src_state, src_eng, dst_state, dst_eng):
+        os.makedirs(d)
+
+    def w(path, text):
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+
+    for state in (src_state, dst_state):
+        w(os.path.join(state, "account.json"), '{"cash": 100.0, "positions": {}}')
+        w(os.path.join(state, "trades.csv"), "time,code,act\n2026-10-30,510880,BUY\n")
+        w(os.path.join(state, "equity.csv"), "date,equity\n2026-10-30,100.0\n")
+    for eng in (src_eng, dst_eng):
+        for n in sync_cloud.SHARED:
+            w(os.path.join(eng, n), "# 同一份代码\n")
+
+    saved = (sync_cloud.SRC_STATE, sync_cloud.SRC_ENGINE, sync_cloud.DST_ROOT,
+             sync_cloud.DST_STATE, sync_cloud.DST_ENGINE, sync_cloud.MARK)
+    saved_argv = sys.argv[:]
+    saved_env = os.environ.pop(sync_cloud.WRITE_ENV, None)
+
+    def run(argv):
+        buf = io.StringIO()
+        sys.argv = ["sync_cloud"] + argv
+        with redirect_stdout(buf):
+            code = sync_cloud.main()
+        return code, buf.getvalue()
+
+    try:
+        sync_cloud.SRC_STATE, sync_cloud.SRC_ENGINE = src_state, src_eng
+        sync_cloud.DST_ROOT = tmp
+        sync_cloud.DST_STATE, sync_cloud.DST_ENGINE = dst_state, dst_eng
+        sync_cloud.MARK = os.path.join(dst_state, ".published")
+
+        # 1) 两边都缺 trades.csv —— 「都没有」不是「一致」
+        os.remove(os.path.join(src_state, "trades.csv"))
+        os.remove(os.path.join(dst_state, "trades.csv"))
+        code, out = run(["--check"])
+        check(code == 6, "缺文件应返回 6，实际 %s" % code)
+        check("NEED_PUBLISH=UNKNOWN" in out, "缺文件时必须给 UNKNOWN，实际输出：%s" % out)
+        check("NEED_PUBLISH=0" not in out, "缺文件被报成了「一致」：%s" % out)
+        w(os.path.join(src_state, "trades.csv"), "time,code,act\n2026-10-30,510880,BUY\n")
+        w(os.path.join(dst_state, "trades.csv"), "time,code,act\n2026-10-30,510880,BUY\n")
+
+        # 2) 云端副本不在 —— 判不了就说判不了，别报 0
+        sync_cloud.DST_ROOT = os.path.join(tmp, "nope")
+        sync_cloud.DST_STATE = os.path.join(sync_cloud.DST_ROOT, "state")
+        sync_cloud.DST_ENGINE = os.path.join(sync_cloud.DST_ROOT, "engine")
+        code, out = run(["--check"])
+        check(code == 2, "副本不存在应返回 2，实际 %s" % code)
+        check("NEED_PUBLISH=0" not in out, "副本不在却报了「无需发布」：%s" % out)
+        sync_cloud.DST_ROOT = tmp
+        sync_cloud.DST_STATE, sync_cloud.DST_ENGINE = dst_state, dst_eng
+
+        # 3) 本地账本与云端不同 → 默认拒绝写入，且一个字节都不许改
+        w(os.path.join(src_state, "account.json"), '{"cash": 50.0, "positions": {}}')
+        before = open(os.path.join(dst_state, "account.json"), encoding="utf-8").read()
+        code, out = run([])
+        after = open(os.path.join(dst_state, "account.json"), encoding="utf-8").read()
+        check(code == 7, "默认应拒绝写入并返回 7，实际 %s" % code)
+        check(before == after, "拒绝写入时仍然改了云端账本")
+
+        # 4) 显式授权后才真写，且写完结论是「需要发布」
+        os.environ[sync_cloud.WRITE_ENV] = "1"
+        code, out = run([])
+        os.environ.pop(sync_cloud.WRITE_ENV, None)
+        after = open(os.path.join(dst_state, "account.json"), encoding="utf-8").read()
+        check(code == 0, "授权写入应返回 0，实际 %s" % code)
+        check(after == '{"cash": 50.0, "positions": {}}', "授权后没同步账本：%s" % after)
+        check("NEED_PUBLISH=1" in out, "同步后应提示重新发布：%s" % out)
+    finally:
+        (sync_cloud.SRC_STATE, sync_cloud.SRC_ENGINE, sync_cloud.DST_ROOT,
+         sync_cloud.DST_STATE, sync_cloud.DST_ENGINE, sync_cloud.MARK) = saved
+        sys.argv = saved_argv
+        if saved_env is None:
+            os.environ.pop(sync_cloud.WRITE_ENV, None)
+        else:
+            os.environ[sync_cloud.WRITE_ENV] = saved_env
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     sys.exit(main())

@@ -2,6 +2,12 @@
 # -*- coding: utf-8 -*-
 """把本地账本和渲染层同步到云端展示副本，并判断要不要重新发布。
 
+⚠️ 2026-10-31 起这个脚本**默认什么也不写**。
+   账本主人是 GitHub Actions（仓库里的 state/），本地 E:\\TradingSim 只是只读镜像；
+   发布通道也已停用。在这种拓扑下，「把本地 state 复制到云端副本」= 用旧账本
+   盖掉线上。所以写入路径改成 fail-closed：必须显式给 SIM_LOCAL_SYNC=1 才动文件。
+   判断类用法（--check）不受影响，仍然只读。
+
 它做两件事，但**不负责发布**——发布要调平台工具，那是 agent 干的活：
 
     1. 比对并同步：account.json / trades.csv / equity.csv，以及
@@ -21,13 +27,27 @@
     所以发布成功后必须调一次 `--mark`，把当时的指纹钉下来。
 
 用法：
-    python engine/sync_cloud.py            # 同步 + 判断，打印结论
-    python engine/sync_cloud.py --check    # 只看，不动文件
+    python engine/sync_cloud.py --check    # 只看，不动文件（默认推荐）
+    python engine/sync_cloud.py            # 同步（需 SIM_LOCAL_SYNC=1，否则拒绝）
     python engine/sync_cloud.py --mark     # 发布成功后调用，记下已发布指纹
 
-最后一行给调用方（自动化任务）看：
-    NEED_PUBLISH=1  → 线上落后了，需要重新发布
-    NEED_PUBLISH=0  → 一致，什么都不用做
+最后一行给调用方（自动化任务）看，**只有三种，不要自己加第四种**：
+    NEED_PUBLISH=1        线上落后了，需要重新发布
+    NEED_PUBLISH=0        一致，什么都不用做
+    NEED_PUBLISH=UNKNOWN  判不了（云端副本不在 / 账本文件缺失 / 通道已停用）
+
+为什么要有 UNKNOWN：
+    原来「云端副本不存在」也打印 NEED_PUBLISH=0，于是「副本没了」「通道停了」
+    和「两边一致」在调用方眼里长得一模一样，都是「无需动作」。2026-10-31
+    自审时 E:\\TradingSim_cloud 已经停在 10-28（cash 9919.50 / 0 持仓，而线上
+    是 54.50 / 1 持仓）却仍然天天报 0——没人会去查一件「看起来没问题」的事。
+    判不了就说判不了。
+
+退出码：
+    0 = 判断完成（结论看最后一行）
+    2 = 云端副本目录不存在（配置问题/通道已停用，不是「一致」）
+    6 = 账本或渲染层文件缺失/读不出来（不是「两边都没有所以一样」）
+    7 = 写入被停用（拓扑保护，见顶部说明）
 """
 import argparse
 import hashlib
@@ -61,13 +81,24 @@ SHARED = ("dashboard.py", "theme.py", "broker.py", "strategy.py", "market.py")
 
 MARK = os.path.join(DST_STATE, ".published")
 
+# 写入开关。名字故意不叫 ALLOW/FORCE 之类容易被随手打开的东西：
+# 它一旦打开，本地这份只读镜像就会盖掉云端账本，只有确认「本地就是账本主人」
+# 时才该设。默认关闭 = 默认安全。
+WRITE_ENV = "SIM_LOCAL_SYNC"
+
+UNKNOWN = "NEED_PUBLISH=UNKNOWN"
+
 
 def sha(path):
-    """内容指纹。文件不存在返回 None，好和"空文件"区分开。"""
+    """内容指纹。文件不存在返回 None，好和"空文件"区分开。
+
+    读不动（权限、被占用、坏盘）**不**当"不存在"——那会把故障说成
+    「两边都没有这个文件」，于是缺失被当成一致。这类错误照抛，由 main 报 6。
+    """
     try:
         with open(path, "rb") as f:
             return hashlib.sha256(f.read()).hexdigest()
-    except OSError:
+    except FileNotFoundError:
         return None
 
 
@@ -87,6 +118,7 @@ def fingerprint():
     """云端副本当前内容的指纹：账本 + 渲染代码。
 
     只在两边一致之后调用，所以它代表「云端目录现在长什么样」。
+    调用前必须过 missing()，否则缺文件会被压成 "-" 混进指纹。
     """
     h = hashlib.sha256()
     for name in FILES:
@@ -94,6 +126,24 @@ def fingerprint():
     for name in SHARED:
         h.update((sha(os.path.join(DST_ENGINE, name)) or "-").encode())
     return h.hexdigest()[:16]
+
+
+def missing():
+    """哪一边缺文件/有几个文件。返回 [(路径, 方向)]，空表示都齐。
+
+    为什么要单列：`sha()` 对两边的缺失都返回 None，`None == None` 会让
+    「两边都没有」被判成「没有差异」。本地 trades.csv 被误删就是这种情况：
+    脚本报「一致」，而账本根本没在同步。
+    """
+    out = []
+    for tag, root, names in (("本地", SRC_STATE, FILES),
+                             ("云端", DST_STATE, FILES),
+                             ("本地", SRC_ENGINE, SHARED),
+                             ("云端", DST_ENGINE, SHARED)):
+        for n in names:
+            if sha(os.path.join(root, n)) is None:
+                out.append((os.path.join(root, n), tag))
+    return out
 
 
 def read_mark():
@@ -113,12 +163,32 @@ def main():
 
     if not os.path.isdir(DST_ROOT):
         print("云端副本不存在：%s" % DST_ROOT)
-        print("NEED_PUBLISH=0")
+        print("  本地是只读镜像、发布通道已停用，这个目录不在属正常；"
+              "但它意味着「线上状态无法由本地判断」，不是「两边一致」。")
+        print(UNKNOWN)
         return 2
 
-    os.makedirs(DST_STATE, exist_ok=True)
+    # 缺文件必须在比对之前拦下，否则缺失会被 None == None 吞成「无差异」。
+    miss = missing()
+    if miss:
+        for path, side in miss:
+            print("缺失    %s %s" % (side, path))
+        print("结论    账本/渲染层文件不全，无法判断同步状态（不等于一致）")
+        print(UNKNOWN)
+        return 6
+
+    # 目录创建只属于写入路径。--check 说好了「不动文件」，就不能顺手
+    # makedirs——那会让一次只读检查在空机器上留下一个空目录树。
+    write_ok = not args.check and not args.mark
+    if write_ok and os.environ.get(WRITE_ENV) != "1":
+        print("拒绝同步  2026-10-21 起账本主人是 GitHub Actions，本地只是只读镜像。")
+        print("          跑这个脚本=用本地镜像覆盖云端副本，方向反了。")
+        print("          --check 可以照用；确需写入请显式设 %s=1。" % WRITE_ENV)
+        print(UNKNOWN)
+        return 7
 
     if args.mark:
+        os.makedirs(DST_STATE, exist_ok=True)
         fp = fingerprint()
         with open(MARK, "w", encoding="ascii") as f:
             f.write(fp)
@@ -134,6 +204,10 @@ def main():
         print("已发布指纹  %s" % fp)
         print("NEED_PUBLISH=0")
         return 0
+
+    if write_ok:
+        os.makedirs(DST_STATE, exist_ok=True)
+        os.makedirs(DST_ENGINE, exist_ok=True)
 
     # ---- 同步渲染层 ----
     code_diff = [n for n in SHARED
@@ -171,9 +245,13 @@ def main():
     for name in diff:
         src = os.path.join(SRC_STATE, name)
         dst = os.path.join(DST_STATE, name)
-        if not os.path.exists(src):
-            print("  跳过    %s（本地没有这个文件）" % name)
-            continue
+        # missing() 已经保证两边都在，这里再判一次只为防御——真缺了必须说
+        # 「没同步成」，不能打印「已同步」。
+        if sha(src) is None:
+            print("  失败    %s（本地读不出来）" % name)
+            print("结论    同步不完整")
+            print(UNKNOWN)
+            return 6
         shutil.copy2(src, dst)
         print("  已同步  %s" % name)
 
@@ -193,4 +271,12 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # 某个文件读不动（被占用/权限/坏了）时，报「判不了」而不是抛栈：
+    # 抛栈的退出码是 1，和「参数写错」混在一起；再说调用方要的是结论，
+    # 不是 traceback。
+    try:
+        sys.exit(main())
+    except OSError as e:
+        print("读取失败：%s: %s" % (type(e).__name__, e))
+        print(UNKNOWN)
+        sys.exit(6)
