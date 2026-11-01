@@ -1067,6 +1067,23 @@ def _params_sig(params):
     return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:8]
 
 
+# 影响回测结果的文件。改这几个以外的任何文件（渲染层、巡检脚本）都不算代码变更。
+_BT_FILES = ("backtest.py", "strategy.py", "broker.py", "market.py")
+
+
+def _code_sig():
+    """回测相关代码的指纹：区分「数据集换了」和「代码换了」。"""
+    h = hashlib.sha1()
+    for name in _BT_FILES:
+        p = os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
+        try:
+            with open(p, "rb") as f:
+                h.update(name.encode("utf-8") + b"\0" + f.read() + b"\0")
+        except OSError:
+            h.update(name.encode("utf-8") + b"\0MISSING\0")
+    return h.hexdigest()[:8]
+
+
 def check_backtest_baseline():
     """同一份缓存、同一套参数，回测结果每次必须一样。
 
@@ -1081,6 +1098,11 @@ def check_backtest_baseline():
        什么都没校验：出场逻辑改坏了照样是 0.00%。所以回归探针固定用
        entry_enabled=True 跑一遍，只比探针结果 —— 探针测的是代码，
        不是「今天想不想交易」。
+
+    3) 数据集每天向后滚一格，days 一变就按当天结果重设基线。可「代码改了」
+       和「数据换了」经常发生在同一晚：第二天早上新基线是用改过的代码跑出来的，
+       退化就被当成新正常放行了，闸门在最需要它的那天失效。所以基线同时存
+       代码指纹，滚动当天若代码也变过，就说「无法区分」，不假装是「一致」。
     """
     base_f = os.path.join(STATE, "baseline.json")
     try:
@@ -1129,7 +1151,8 @@ def check_backtest_baseline():
     def save():
         with open(base_f, "w", encoding="utf-8") as f:
             json.dump({"ret_pct": ret, "trades": n, "days": days,
-                       "params": sig, "saved": datetime.now().strftime("%Y-%m-%d %H:%M")},
+                       "params": sig, "code": _code_sig(),
+                       "saved": datetime.now().strftime("%Y-%m-%d %H:%M")},
                       f, ensure_ascii=False, indent=2)
 
     base = _read_json(base_f)
@@ -1142,10 +1165,30 @@ def check_backtest_baseline():
     if base.get("days") != days:
         # 缓存按天滚动，days 变了是常态，不是故障。但「换了数据集」和
         # 「同一份数据结果漂移」必须分开说，否则报「与基线一致」是假话。
+        again = base.get("code")
+        now = _code_sig()
         save()
+        if again and again != now:
+            # 代码和数据集同一晚都变了：新基线是「改过的代码 + 新数据」跑出来的，
+            # 谁造成的差异分不开。这条不能因「已重设」就报绿。
+            add(WARN, "回归", "回测基线",
+                "数据集滚动（%d 日 → %d 日）与回测代码变更（%s → %s）同时发生："
+                "新基线 %.2f%% / %d 笔已按两者重设，无法据此判断这是数据变化还是代码退化"
+                "（旧基线 %.2f%% / %d 笔）。确认无退化后，下一次数据集滚动起恢复比对%s"
+                % (len(base.get("days") or []), len(days), again, now, ret, n,
+                   float(base.get("ret_pct", 0)), base.get("trades", 0),
+                   "；另 " + tail.strip("；") if tail else ""))
+            return
+        if not again:
+            add(OK, "回归", "回测基线",
+                "数据集滚动（%d 日 → %d 日），已按新数据集重设基线 探针 %.2f%% / %d 笔"
+                "（旧基线无代码指纹，本轮无法区分数据/代码；已补记 %s）%s"
+                % (len(base.get("days") or []), len(days), ret, n, now, tail))
+            return
         add(OK, "回归", "回测基线",
-            "数据集滚动（%d 日 → %d 日），已按新数据集重设基线 探针 %.2f%% / %d 笔（%s）%s"
-            % (len(base.get("days") or []), len(days), ret, n, live_txt, tail))
+            "数据集滚动（%d 日 → %d 日，回测代码未变 %s），已按新数据集重设基线 "
+            "探针 %.2f%% / %d 笔（%s）%s"
+            % (len(base.get("days") or []), len(days), now, ret, n, live_txt, tail))
         return
 
     if "params" not in base:
