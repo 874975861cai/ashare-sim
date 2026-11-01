@@ -2,7 +2,12 @@
 """看板视觉主题：科幻 HUD 风格。
 
 抽成独立文件，换风格只改这里，不动渲染逻辑。
-所有颜色集中在上面的 :root 变量里，改配色不用翻代码。
+
+配色的层级别搞混（原来这里写「所有颜色集中在 :root，改配色不用翻代码」，
+是假的）：:root 只管基色和语义色，改涨跌红绿、底色、主强调色只动那里就够；
+但面板渐变、发光、半透明描边这些是逐个组件手调的，:root 之外还有几十处
+写死的色值——那是刻意的（同一个青在深底上要三种亮度才看得清），
+要整页换色相得连这些一起扫，别只改 :root 就以为改完了。
 
 设计约束：
   - 自包含，不引用任何外部字体/图片/CDN
@@ -28,7 +33,6 @@ PAGE_CSS = """
     --dim-2:#5f7fa8;
     --up:#ff4d6a;
     --down:#22e6a0;
-    --amber:#f5a524;
   }
 
   body{
@@ -111,43 +115,6 @@ PAGE_CSS = """
     background:var(--down);margin-right:7px;vertical-align:1px;
     box-shadow:0 0 9px var(--down);animation:pulse 2s ease-in-out infinite;
   }
-
-  .kpis{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:14px}
-  .kpi{
-    position:relative;overflow:hidden;
-    background:linear-gradient(160deg,var(--panel-a),var(--panel-b));
-    border:1px solid var(--line);border-radius:9px;
-    padding:15px 15px 14px;
-    box-shadow:inset 0 1px 0 rgba(255,255,255,.045), 0 10px 28px rgba(0,0,0,.45);
-    transition:border-color .25s, box-shadow .25s, transform .25s;
-  }
-  .kpi:hover{
-    border-color:rgba(34,211,238,.34);
-    box-shadow:inset 0 1px 0 rgba(255,255,255,.06),
-               0 10px 30px rgba(0,0,0,.5),
-               0 0 26px rgba(34,211,238,.12);
-    transform:translateY(-1px);
-  }
-  .kpi::before{
-    content:"";position:absolute;top:0;left:0;right:0;height:1px;
-    background:linear-gradient(90deg,transparent,rgba(34,211,238,.70),transparent);
-  }
-  .kpi::after{
-    content:"";position:absolute;right:-26px;bottom:-26px;width:78px;height:78px;
-    background:radial-gradient(circle,rgba(34,211,238,.15),transparent 70%);
-    pointer-events:none;
-  }
-  .kpi .lab{
-    font-size:10.5px;color:var(--dim-2);margin-bottom:8px;
-    letter-spacing:1.4px;text-transform:uppercase;
-  }
-  .kpi .val{
-    font-size:23px;font-weight:700;letter-spacing:.4px;
-    font-family:ui-monospace,Consolas,"SF Mono",monospace;
-    font-variant-numeric:tabular-nums;color:#eaf6ff;
-    text-shadow:0 0 18px rgba(34,211,238,.26);
-  }
-  .kpi .sub{font-size:11px;color:var(--dim);margin-top:6px}
 
   .card{
     position:relative;
@@ -399,7 +366,6 @@ PAGE_CSS = """
   }
 
   @media(max-width:900px){
-    .kpis{grid-template-columns:repeat(2,1fr)}
     .two{grid-template-columns:1fr}
     .tscroll{overflow-x:auto;-webkit-overflow-scrolling:touch}
     .tscroll table{min-width:max-content}
@@ -411,11 +377,16 @@ PAGE_CSS = """
     .core-val{font-size:16px}
     .orbit-stats{grid-template-columns:repeat(3,1fr);row-gap:12px}
   }
+  /* 窄屏：节点尺寸是硬像素，而节点间距随容器宽度等比缩小，屏幕越窄越挤。
+     标的池 13 个节点、72px 宽时，椭圆顶部相邻节点的弧长间距只有 ~70px，
+     实测 9 对互相压住（最多 32×45px），价格数字被邻块盖掉。收到 52px 并把
+     轨道加高（440→470），实测重叠归零（1440/1024/900/492 四个宽度都测过）。
+     余地不大：池子扩到 15 只以上要重新量，别只看桌面。 */
   @media(max-width:560px){
-    .orbit{height:440px}
-    .node{width:72px;margin:-26px 0 0 -36px}
-    .nd-px{font-size:11.5px}
-    .nd-pct,.nd-dev{font-size:8.5px}
+    .orbit{height:470px}
+    .node{width:52px;margin:-24px 0 0 -26px;padding:3px 2px 4px}
+    .nd-px{font-size:11px}
+    .nd-pct,.nd-dev{font-size:8px}
     .core{width:132px;height:132px;margin:-66px 0 0 -66px}
     .core-inner{width:106px;height:106px}
     .core-val{font-size:13px}
