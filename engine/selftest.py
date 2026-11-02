@@ -1057,5 +1057,92 @@ def t_sync_cloud_states():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+@case("预热：降级/不完整/窗口错开都不能算「成功」")
+def t_warmup_states():
+    """warm 存在的意义是「把缓存刷到今天」，而 market.fetch_trends 在接口挂掉时
+    不抛错，只是**降级**返回更早写下的缓存。原实现把这种返回值一律算成功：
+    2026-11-02 实测 13 只标的里 11 只是 10-20 的旧文件，脚本仍打印
+    「完成：成功 15 / 失败 0」——唯一的观测点把「数据陈旧」抹掉了，
+    而 backtest / weekly / exitstudy 全吃这份缓存。
+    """
+    import io
+    from contextlib import redirect_stdout
+    import warmup
+
+    full = ["2026-10-26", "2026-10-27", "2026-10-28", "2026-10-29", "2026-10-30"]
+
+    def mk(days, stale=False):
+        ticks = [{"t": d + " 09:30", "price": 1.0, "vol": 1.0, "avg": 1.0} for d in days]
+        d = {"code": "X", "name": "X", "ticks": ticks}
+        if stale:
+            d.update({"stale": True, "stale_reason": "接口失败，用更早的缓存"})
+        return d
+
+    def run(fake, codes):
+        old_t, old_w, old_s = market.fetch_trends, warmup.WAIT_BASE, warmup.SPACING
+        market.fetch_trends = fake
+        warmup.WAIT_BASE = warmup.SPACING = 0
+        try:
+            with redirect_stdout(io.StringIO()):
+                return warmup.main(codes=codes)
+        finally:
+            market.fetch_trends = old_t
+            warmup.WAIT_BASE, warmup.SPACING = old_w, old_s
+
+    check(run(lambda c, ndays=5, ttl=0: mk(full), ["A", "B"]) == 0,
+          "全部新鲜应返回 0")
+    check(run(lambda c, ndays=5, ttl=0: mk(full, True), ["A", "B"]) == 2,
+          "降级缓存被报成了成功：这正是把旧数据当「已刷新」的那个 bug")
+    check(run(lambda c, ndays=5, ttl=0: mk(full[:2]), ["A", "B"]) == 2,
+          "日数只有 2/5 却被报成成功")
+    check(run(lambda c, ndays=5, ttl=0: mk(full) if c == "A" else mk(full[:1]),
+              ["A", "B"]) == 2,
+          "各标的窗口错开（10-30 / 10-26）却没报出来")
+    out = warmup.warm(codes=[], verbose=False)
+    check(out["requested"] == 0,
+          "传空列表被当成了整池：requested=%s" % out["requested"])
+
+
+@case("回测：离线用旧缓存必须标「降级」，窗口错开必须能量出来")
+def t_backtest_offline_degraded():
+    """离线回测退回「最近一次」缓存是对的（要能断网跑），但原来直接取
+    blob["data"]，不带 stale / as_of，于是 report["degraded"] 永远为空：
+    2026-11-02 实测 13 只标的全是 10-13~10-30 的旧文件，报告写
+    「ok 13/13、degraded 0」，doctor 据此认为数据齐了。
+
+    更重的一条：trading_days() 取各标的日期的并集，不同标的写在不同日期时，
+    并集会拼出横跨数周的假窗口，后段只剩一两只标的——回测照跑、指标照算、
+    基线照比，全是绿的。这里把两条都钉住。
+    """
+    tmp = tempfile.mkdtemp(prefix="tsim_cache_")
+    old_dir = market.CACHE_DIR
+    try:
+        market.CACHE_DIR = tmp
+        plan = {
+            "AAA": ["2026-10-14", "2026-10-15", "2026-10-16", "2026-10-19", "2026-10-20"],
+            "BBB": ["2026-10-26", "2026-10-27", "2026-10-28", "2026-10-29", "2026-10-30"],
+        }
+        for code, ds in plan.items():
+            ticks = [{"t": d + " 09:30", "price": 1.0, "vol": 1.0, "avg": 1.0}
+                     for d in ds]
+            path = os.path.join(tmp, "trends_%s_5_20261020.json" % code)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"_ts": 1, "data": {"code": code, "name": code,
+                                              "ticks": ticks}}, f)
+        rep = {}
+        data = backtest.load_pool(["AAA", "BBB"], ndays=5, verbose=False,
+                                  offline=True, report=rep)
+        check(len(data) == 2, "旧缓存应能读到，实际 %d 只" % len(data))
+        check(len(rep.get("degraded") or []) == 2,
+              "离线用旧缓存没标降级，degraded=%r" % (rep.get("degraded"),))
+        h = backtest.dataset_health(data, ndays=5)
+        check(h["span"] > h["ndays"],
+              "10 个交易日被拼成「5 天窗口」却没量出来：span=%s" % h["span"])
+        check(h["thin"], "后段只有 1 只标的的交易日没被标记")
+    finally:
+        market.CACHE_DIR = old_dir
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     sys.exit(main())

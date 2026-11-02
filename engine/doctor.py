@@ -1084,6 +1084,37 @@ def _code_sig():
     return h.hexdigest()[:8]
 
 
+def _check_dataset_window(data, rep, backtest, strategy):
+    """回测数据集是不是「同一天写下的 5 日横截面」。
+
+    为什么单独一条：backtest.trading_days() 取的是各标的日期的**并集**，
+    各标的的缓存写在不同日期时，并集会拼出一个横跨数周、后段只剩一两只标的的
+    假窗口；回测照跑、指标照算、基线照比，每一项都是绿的。2026-11-02 实测正是
+    这种状态：13 只标的里 11 只停在 10-20、2 只到 10-30，并集 13 个交易日，
+    其中 7 天只有 1~3 只标的参与。
+    """
+    h = backtest.dataset_health(data, ndays=5)
+    deg = rep.get("degraded") or []
+    dg_txt = ""
+    if deg:
+        ds = sorted({str(t)[:10] for _, t in deg})
+        dg_txt = "%d/%d 只用旧缓存（截至 %s）" % (
+            len(deg), rep.get("requested", len(strategy.CORE_POOL)),
+            ds[0] if len(ds) == 1 else "%s~%s" % (ds[0], ds[-1]))
+    if h["span"] > h["ndays"] or h["thin"]:
+        thin_txt = "、".join("%s:%d只" % (d[5:], k) for d, k in h["thin"][:4])
+        add(WARN, "数据", "回测数据集",
+            "窗口是拼出来的：并集 %d 天（缓存应为 %d 天），%d 天不足半数标的（%s）%s%s"
+            % (h["span"], h["ndays"], len(h["thin"]), thin_txt,
+               "；" if dg_txt else "", dg_txt))
+    elif dg_txt:
+        add(WARN, "数据", "回测数据集",
+            "%s；横截面 %d 只 × %d 天" % (dg_txt, h["codes"], h["span"]))
+    else:
+        add(OK, "数据", "回测数据集",
+            "%d 只 × %d 天，同一天写入，横截面完整" % (h["codes"], h["span"]))
+
+
 def check_backtest_baseline():
     """同一份缓存、同一套参数，回测结果每次必须一样。
 
@@ -1118,6 +1149,9 @@ def check_backtest_baseline():
         if not data:
             add(WARN, "回归", "回测基线", "本地缓存不足，跳过")
             return
+        # 数据集窗口体检（2026-11-02 补）。必须在这里做，因为只有这里手上已经
+        # 有加载好的 data；而且要卡在「比基线」之前——基线本身可能是错的。
+        _check_dataset_window(data, rep, backtest, strategy)
         days = [d for d in backtest.trading_days(data)
                 if d != datetime.now().strftime("%Y-%m-%d")]
         if not days:
@@ -1142,6 +1176,10 @@ def check_backtest_baseline():
         tail = "；%d/%d 只标的缺数据（%s），本轮回归没覆盖到它们" % (
             len(miss), rep.get("requested", len(strategy.CORE_POOL)),
             "、".join("%s:%s" % (c, str(w)[:16]) for c, w in miss[:3]))
+    # 用的是旧缓存也要说出来：「同一份数据两次结果一样」在数据本身过期时
+    # 只证明代码稳定，不证明结论有效。别让读者把绿看成「这数能信」。
+    if rep.get("degraded"):
+        tail += "；其中 %d 只用旧缓存（见「数据 回测数据集」）" % len(rep["degraded"])
     live_txt = "现行参数 %.2f%% / %d 笔" % (float(m_live.get("ret_pct", 0)),
                                           int(m_live.get("trades", 0)))
     if m_live.get("open_code"):

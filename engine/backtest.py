@@ -37,15 +37,26 @@ def load_pool(codes, ndays=5, verbose=True, offline=False, report=None):
             if offline:
                 path = market._cpath(f"trends_{c}_{ndays}_{today}.json")
                 blob = market._read(path)
-                if not blob:
-                    old = market._stale(f"trends_{c}_{ndays}_")
-                    blob = old
-                if not blob:
-                    if verbose:
-                        print(f"  - {c} 无缓存")
-                    failed.append((c, "无缓存"))
-                    continue
-                tr = blob["data"]
+                if blob:
+                    tr = blob["data"]
+                else:
+                    # 退回「最近一次」缓存。这条通道原来直接取 blob["data"]，
+                    # 不带 stale / as_of 标记，于是 report["degraded"] 永远是空的：
+                    # 2026-11-02 实测 13 只标的全是 10-13~10-30 的旧文件，
+                    # 报告却写「ok 13/13 / degraded 0」，doctor 也就按「数据齐了」
+                    # 去比回归基线。离线读旧缓存本身是对的（回测要能离线跑），
+                    # 错在不说。
+                    blob = market._stale(f"trends_{c}_{ndays}_")
+                    if not blob:
+                        if verbose:
+                            print(f"  - {c} 无缓存")
+                        failed.append((c, "无缓存"))
+                        continue
+                    ts = blob.get("_ts") or 0
+                    tr = market._degrade(
+                        blob, "离线模式：无当日缓存，用 %s 写入的缓存"
+                        % (market.time.strftime("%Y-%m-%d %H:%M", market.time.localtime(ts))
+                           if ts else "更早"))
             else:
                 tr = market.fetch_trends(c, ndays=ndays)
         except Exception as e:  # noqa: BLE001
@@ -98,6 +109,29 @@ def trading_days(data):
     for v in data.values():
         ds |= set(v["days"].keys())
     return sorted(ds)
+
+
+def dataset_health(data, ndays=5):
+    """检查「回测窗口是不是同一段时间的横截面」。
+
+    为什么要单独有这个函数：trading_days() 取的是各标的日期的**并集**，
+    所以不同标的的缓存写在不同日期时，并集会拼出一个横跨数周、后段只剩
+    一两只标的的假窗口，而回测照跑、指标照算、报告全绿。2026-11-02 实测：
+    13 只标的里 11 只的缓存停在 10-20，2 只到 10-30，并集成了 13 个交易日，
+    其中 7 天只有 1~3 只标的参与——回归基线就是在这份窗口上比出来的。
+    这类问题不会抛错，只能主动量。
+
+    返回 {codes, days, span, ndays, coverage, thin}：
+      span  = 并集天数，正常应等于 ndays（全池同一天写的缓存）；
+      thin  = 参与标的不足一半的交易日，正常应为空。
+    """
+    days = trading_days(data)
+    n = len(data)
+    coverage = [(d, sum(1 for v in data.values() if d in v["days"])) for d in days]
+    half = max(2, (n + 1) // 2)
+    thin = [(d, k) for d, k in coverage if k < half]
+    return {"codes": n, "days": days, "span": len(days), "ndays": ndays,
+            "coverage": coverage, "thin": thin}
 
 
 def _limit_block(code, name, preclose, side, quote, px):
