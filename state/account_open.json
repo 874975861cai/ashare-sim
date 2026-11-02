@@ -1,5 +1,5 @@
 {
-  "date": "2026-10-30",
+  "date": "2026-11-02",
   "account": {
     "meta": {
       "init_capital": 10000.0,
@@ -29,7 +29,7 @@
       }
     },
     "trade_seq": 11,
-    "today": "2026-10-29",
+    "today": "2026-10-30",
     "peak_equity": 10000.0
   },
   "params_sig": "c339f643dc6c"
