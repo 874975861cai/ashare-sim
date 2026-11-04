@@ -6,13 +6,21 @@
     建 blob -> 建 tree -> 建 commit -> 移动 ref
 一次调用完成多文件提交，不会把一个改动拆成七八个 commit。
 
-提交内容取的是 **git 里已存的 blob**（`git show HEAD:<path>`），
+默认提交内容取的是 **git 里已存的 blob**（`git show HEAD:<path>`），
 不是工作区字节。这样绕过 core.autocrlf 的 CRLF/LF 差异——
 之前就是因为本地 CRLF、云端 CRLF 不一致，导致同一份流水哈希永远不等。
 
+--worktree 则刻意推**磁盘上的字节**：工作区改了还没提交时用这个。
+2026-11-04 踩到：11-03 的 doctor 修复只存在于工作区，按提示跑
+`push_repo.py engine/doctor.py`，脚本拿 HEAD 的旧 blob 推上去、还打印
+「已提交」+ 退出码 0 —— 远端根本没变，修复白等一天。所以现在：
+目标文件在 HEAD 与工作区不一致且没给 --worktree 时直接拒绝（退出码 3），
+不再静默推旧内容。
+
 用法：
     python engine/push_repo.py --list                # 看本地领先远端哪些文件
-    python engine/push_repo.py engine/foo.py a.md    # 推指定文件
+    python engine/push_repo.py engine/foo.py a.md    # 推指定文件（须已提交）
+    python engine/push_repo.py --worktree engine/foo.py   # 推磁盘上的当前内容
     python engine/push_repo.py --all                 # 推本地领先的全部
     python engine/push_repo.py --all --message "..."  # 自定义提交信息
 
@@ -84,10 +92,25 @@ def changed_files():
     core.quotepath=false 是必须的：否则中文文件名会被转义成
     "\\344\\272\\244..." 这种八进制串，推上去就是一个不存在的路径。
     """
-    git("fetch", "origin", "main")
+    git("fetch", "origin", "main", timeout=90)
     r = git("-c", "core.quotepath=false", "diff", "--name-only",
             "origin/main", "HEAD")
     return [x.strip() for x in r.stdout.splitlines() if x.strip()]
+
+
+def head_bytes(path):
+    """HEAD 里该文件的字节；不在 git 里返回 None。"""
+    r = subprocess.run(["git", "show", "HEAD:%s" % path], cwd=BASE,
+                       capture_output=True)
+    return r.stdout if r.returncode == 0 else None
+
+
+def worktree_bytes(path):
+    try:
+        with open(os.path.join(BASE, path), "rb") as f:
+            return f.read()
+    except OSError:
+        return None
 
 
 def main(argv):
@@ -95,6 +118,8 @@ def main(argv):
     ap.add_argument("files", nargs="*")
     ap.add_argument("--all", action="store_true", help="推送本地领先远端的全部文件")
     ap.add_argument("--list", action="store_true", help="只列出差异")
+    ap.add_argument("--worktree", action="store_true",
+                    help="推磁盘上的当前内容（工作区有未提交改动时用这个）")
     ap.add_argument("--message", default="", help="提交信息")
     args = ap.parse_args(argv)
 
@@ -121,14 +146,45 @@ def main(argv):
     commit = api("/repos/%s/git/commits/%s" % (REPO, head), tok=tok)
     base_tree = commit["tree"]["sha"]
 
-    entries = []
+    # 取内容：默认取 HEAD 的 blob，--worktree 取磁盘字节。
+    # 关键是不能「悄悄换成旧版本」：工作区和 HEAD 不一致时必须让人知道。
+    payload = {}
+    dirty = []
     for path in targets:
-        r = subprocess.run(["git", "show", "HEAD:%s" % path], cwd=BASE,
-                           capture_output=True)
-        if r.returncode != 0:
-            raise SystemExit("git 里没有这个文件：%s" % path)
+        head = head_bytes(path)
+        disk = worktree_bytes(path)
+        if args.worktree:
+            if disk is None:
+                raise SystemExit("磁盘上没有这个文件：%s" % path)
+            payload[path] = disk
+            continue
+        if head is None:
+            if disk is None:
+                raise SystemExit("git 里没有这个文件：%s" % path)
+            dirty.append("%s（从未提交过）" % path)
+            continue
+        if disk is not None and disk != head:
+            dirty.append(path)
+            continue
+        payload[path] = head
+    if dirty:
+        print("拒绝推送：这些文件的工作区内容和 HEAD 不一致，"
+              "直接推 HEAD 会把旧版本推上去：")
+        for d in dirty:
+            print("  - " + d)
+        print("改用：python engine/push_repo.py --worktree " + " ".join(targets))
+        return 3
+
+    tok = token()
+    ref = api("/repos/%s/git/ref/heads/main" % REPO, tok=tok)
+    head = ref["object"]["sha"]
+    commit = api("/repos/%s/git/commits/%s" % (REPO, head), tok=tok)
+    base_tree = commit["tree"]["sha"]
+
+    entries = []
+    for path, raw in payload.items():
         blob = api("/repos/%s/git/blobs" % REPO, "POST",
-                   {"content": base64.b64encode(r.stdout).decode("ascii"),
+                   {"content": base64.b64encode(raw).decode("ascii"),
                     "encoding": "base64"}, tok=tok)
         entries.append({"path": path, "mode": "100644", "type": "blob",
                         "sha": blob["sha"]})

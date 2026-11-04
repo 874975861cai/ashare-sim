@@ -1144,5 +1144,33 @@ def t_backtest_offline_degraded():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+@case("心跳：云端跑过但无成交未提交，不能报「云端没跑」")
+def t_cloud_run_evidence():
+    """账本提交策略是「有新成交才提交，无成交只在收盘后提交一次」。
+
+    于是「盘中缺今日净值行」是常态，而旧逻辑一律报「云端自动化可能没跑」：
+    每个无成交的早上都误报一次，真没跑那天反而淹在噪音里（2026-11-03 实测
+    09:32 云端跑成功过一轮，只因当日无成交未提交，体检照样报可能没跑）。
+    这里把「从 Actions 记录认出云端跑过」这条证据钉住：只认今天的、
+    已完成的、成功的；北京时间要换算对，否则会数成别的日子。
+    """
+    today = "2026-11-03"
+    runs = [
+        {"created_at": "2026-11-03T01:32:49Z", "status": "completed",
+         "conclusion": "success"},
+        {"created_at": "2026-11-03T02:10:00Z", "status": "completed",
+         "conclusion": "failure"},
+        {"created_at": "2026-11-03T02:20:00Z", "status": "in_progress",
+         "conclusion": None},
+        {"created_at": "2026-11-02T12:55:42Z", "status": "completed",
+         "conclusion": "success"},
+    ]
+    n, last = doctor.cloud_run_evidence(runs, today)
+    check(n == 1, "只该数到今天那 1 轮成功运行，实际 %d 轮" % n)
+    check(last == "09:32", "UTC→北京时间换算错了：%s" % last)
+    check(doctor.cloud_run_evidence([], today)[0] == 0, "空记录应得 0 轮")
+    check(doctor.cloud_run_evidence(None, today)[0] == 0, "None 应得 0 轮")
+
+
 if __name__ == "__main__":
     sys.exit(main())

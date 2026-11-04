@@ -33,10 +33,12 @@ import csv
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import time
-from datetime import datetime
+import urllib.request
+from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -611,6 +613,59 @@ def ledger_watch_active(weekday, hm):
     return "10:00" <= hm <= "16:30"
 
 
+def cloud_run_evidence(runs, today):
+    """从 Actions 运行记录里数出「今天云端到底跑了几轮」。
+
+    纯函数，方便自测。runs 是 api.github.com 的 workflow_runs 列表。
+    只认 completed + success：排队中/失败的一轮证明不了账本被写对。
+    返回 (轮数, 最后一轮的北京时间 "HH:MM")。
+    """
+    n, last = 0, ""
+    for w in runs or []:
+        created = str(w.get("created_at") or "")
+        if len(created) < 19:
+            continue
+        try:
+            dt = datetime.strptime(created[:19], "%Y-%m-%dT%H:%M:%S")
+        except ValueError:
+            continue
+        cst = dt + timedelta(hours=8)
+        if cst.strftime("%Y-%m-%d") != today:
+            continue
+        if str(w.get("status")) != "completed" or str(w.get("conclusion")) != "success":
+            continue
+        n += 1
+        hm = cst.strftime("%H:%M")
+        if hm > last:
+            last = hm
+    return n, last
+
+
+def _actions_runs():
+    """拉云端最近若干轮 Actions 记录。返回 (runs, 失败原因)。
+
+    为什么走 api.github.com 而不是 git fetch：两者是不同主机。2026-11-03
+    实测 github.com:443 连不上（git fetch 全挂），api.github.com 却正常——
+    正是需要判断「云端跑没跑」的那天，走 git 会一无所获。
+    未认证调用限额 60 次/小时，体检一天跑几次，够用。
+    """
+    rc, url, _ = _git("remote", "get-url", "origin")
+    if rc != 0 or not url:
+        return None, "读不到 origin 地址"
+    m = re.search(r"github\.com[:/]+([^/]+)/([^/\s]+?)(?:\.git)?$", url.strip())
+    if not m:
+        return None, "origin 不是 github 仓库"
+    api = ("https://api.github.com/repos/%s/%s/actions/runs?per_page=20"
+           % (m.group(1), m.group(2)))
+    try:
+        req = urllib.request.Request(api, headers={"User-Agent": "ashare-sim-doctor"})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            d = json.loads(r.read().decode("utf-8"))
+    except Exception as e:  # noqa: BLE001
+        return None, "查 Actions 失败：%s" % type(e).__name__
+    return (d.get("workflow_runs") or []), ""
+
+
 def check_heartbeat():
     """判断「自动化还在跑吗」。
 
@@ -654,9 +709,29 @@ def check_heartbeat():
                 "本地副本过期，已从云端同步并写入今日账本%s" % note)
             return
         seg = "盘中" if hm <= "15:30" else "收盘后"
+        # 账本的提交策略是「有新成交才提交，无成交只在收盘后提交一次」
+        # （见 trade.yml「账本入库存档」）。所以盘中缺今日净值行，多数时候
+        # 只是「今天还没成交」，不是云端没跑——可这两种情况在本地长得一模
+        # 一样。补一条不依赖账本自身的证据：Actions 运行记录。云端真跑过就
+        # 说清楚，确实没跑才继续喊；否则每个无成交的早上都喊一遍「可能没跑」，
+        # 真没跑那天反而没人信（2026-11-03 实测：09:32 云端跑成功过一轮，
+        # 只因无成交未提交，体检照样报「可能没跑」）。
+        runs, why = _actions_runs()
+        n, last_t = cloud_run_evidence(runs, today)
+        if n and hm < "15:30":
+            add(OK, "运行时", "任务心跳",
+                "云端今日已执行 %d 轮（最后 %s）；今日无成交，按提交策略盘中不入库，"
+                "本地镜像没有今日净值行属正常%s" % (n, last_t, note))
+            return
+        if n:
+            why = "；云端今日已执行 %d 轮（最后 %s），但账本没有今日净值行" % (n, last_t)
+        elif why:
+            why = "；%s" % why
+        else:
+            why = "；云端今日没有成功执行的记录"
         add(WARN, "运行时", "任务心跳",
-            "%s但今天账本还没有净值行（最后 %s），云端自动化可能没跑%s"
-            % (seg, led_day or "无", detail))
+            "%s但今天账本还没有净值行（最后 %s），云端自动化可能没跑%s%s"
+            % (seg, led_day or "无", detail, why))
         return
 
     if hb_dt is not None:
