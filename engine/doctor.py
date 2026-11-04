@@ -514,13 +514,29 @@ def _sync_local_ledger():
     _, dirty_s, _ = _git("diff", "--name-only")
     _, incoming_s, _ = _git("diff", "--name-only", "HEAD", "origin/main")
     dirty = set(x for x in dirty_s.splitlines() if x.strip())
-    conflict = dirty & set(x for x in incoming_s.splitlines() if x.strip())
+    incoming = set(x for x in incoming_s.splitlines() if x.strip())
+
+    # 工作区字节已经等于云端那份的，对齐它不会丢任何东西，先放行
+    same = set()
+    for p in sorted(dirty & incoming):
+        rc, _, _ = _git("diff", "--quiet", "origin/main", "--", p)
+        if rc == 0:
+            same.add(p)
+    conflict, align = split_conflict(dirty, incoming, same)
 
     action, msg = sync_decision(behind, ahead, conflict)
     if action == "skip":
         return False, "；云端也没有今日提交（本地已同步到最新）"
     if action == "manual":
         return False, "；云端已提交 %d 个版本待同步，但%s" % (behind, msg)
+
+    # 到这一步确定要快进合并了：把「本来就等于云端那份」的脏文件对齐，
+    # 否则 git 会以「本地改动会被覆盖」为由拒绝合并。
+    if align:
+        rc, _, err = _git("checkout", "origin/main", "--", *sorted(align))
+        if rc != 0:
+            first = (err.splitlines() or ["未知错误"])[0][:60]
+            return False, "；本地改动与云端一致，可以对齐，但 checkout 失败：%s" % first
 
     rc, _, err = _git("merge", "--ff-only", "origin/main")
     if rc != 0:
@@ -535,6 +551,21 @@ def _num(s):
         return float(str(s).replace("¥", "").replace(",", "").strip())
     except (TypeError, ValueError):
         return None
+
+
+def split_conflict(dirty, incoming, same_as_remote):
+    """把「本地改过、快进合并又会覆盖」的文件分成两类。
+
+    为什么要分：本地推了代码但 pull 不下来（github.com 不通、api.github.com 通）
+    时会留下一种状态——工作区内容和云端那份**逐字节相同**，但相对 HEAD 是脏的。
+    旧的冲突判定只看「脏 ∩ 待合入」，于是把它当成必须人工处理的冲突，明明没有
+    任何本地改动会丢，却永远报「云端有提交待同步，但本地有改动」（2026-11-04）。
+    这里把「已等于云端那份」的挑出来：对这些文件 checkout 到 origin/main 的版本
+    不改变任何字节，因此可以直接对齐；剩下的才是真冲突。
+    """
+    both = set(dirty) & set(incoming)
+    align = {p for p in both if p in set(same_as_remote)}
+    return both - align, align
 
 
 def check_mirror():

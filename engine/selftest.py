@@ -1172,5 +1172,31 @@ def t_cloud_run_evidence():
     check(doctor.cloud_run_evidence(None, today)[0] == 0, "None 应得 0 轮")
 
 
+@case("同步闸门：工作区已等于云端那份，不能算「本地有改动」")
+def t_split_conflict():
+    """本地推了代码、却因 github.com 不通拉不下来，会留下一种状态：
+    工作区字节已经和云端完全一致，但相对 HEAD 是脏的。旧判定只看
+    「脏 ∩ 待合入」，于是永远报「云端有提交待同步，但本地有改动」——
+    实际一个字节都不会丢，白等一次人工确认（2026-11-04 实测）。
+
+    只有「脏 ∩ 待合入 ∩ 与云端不同」才算真冲突，其余可以让路。
+    """
+    dirty = {"engine/doctor.py", "engine/selftest.py", "state/baseline.json"}
+    incoming = {"engine/doctor.py", "engine/selftest.py"}
+    same = {"engine/doctor.py", "engine/selftest.py"}
+    block, align = doctor.split_conflict(dirty, incoming, same)
+    check(not block, "都被云端版本覆盖了，不该阻塞：%s" % sorted(block))
+    check(align == same, "应整体放行，实际 %s" % sorted(align))
+
+    # 真改过（内容与云端不同）的那只必须留下，等着人看
+    block2, align2 = doctor.split_conflict(dirty, incoming, {"engine/doctor.py"})
+    check(block2 == {"engine/selftest.py"}, "真冲突被放行了：%s" % sorted(block2))
+    check(align2 == {"engine/doctor.py"}, "可对齐的没挑出来：%s" % sorted(align2))
+
+    # baseline.json 脏但云端没动它，与本函数无关
+    block3, align3 = doctor.split_conflict(dirty, set(), same)
+    check(not block3 and not align3, "云端没动的脏文件不该进冲突集")
+
+
 if __name__ == "__main__":
     sys.exit(main())
