@@ -33,9 +33,11 @@ from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import backtest    # noqa: E402
+import analyze     # noqa: E402
 import broker      # noqa: E402
 import doctor      # noqa: E402
 import market      # noqa: E402
+import push_repo   # noqa: E402
 import runner      # noqa: E402
 import strategy    # noqa: E402
 
@@ -1196,6 +1198,65 @@ def t_split_conflict():
     # baseline.json 脏但云端没动它，与本函数无关
     block3, align3 = doctor.split_conflict(dirty, set(), same)
     check(not block3 and not align3, "云端没动的脏文件不该进冲突集")
+
+
+@case("信号诊断：跨午休的持有期不是持有 h 分钟，必须剔除")
+def t_analyze_horizon():
+    """分时是一天 241 根，午休前后索引相邻但时间不连续。
+
+    旧写法用 ticks[i + h] 当「h 分钟后」：11:20 的第 60 根是 13:50，
+    实际持有 2.5 小时。2026-11-04 实测 60 分钟档 40 个样本里 8 个是这种，
+    它们的均值 0.924%（胜率 100%）对 0.178%（胜率 72%）——足以把
+    「持有 60 分钟很赚」这个结论凭空造出来，而策略根本拿不到这个收益。
+    """
+    def mk(times):
+        return [{"t": "2026-11-03 " + t, "price": 4.0} for t in times]
+
+    day = mk(["09:58", "09:59", "10:00", "10:01", "10:02", "10:03"])
+    check(analyze.same_session_ahead(day, 2, 1), "10:00 到 10:01 是 1 分钟，不该被剔")
+    check(analyze.same_session_ahead(day, 2, 3), "10:00 到 10:03 是 3 分钟，应保留")
+
+    # 11:29 的下一根是 13:01，索引相邻、时间差 92 分钟
+    lunch = mk(["11:29", "13:01"])
+    check(not analyze.same_session_ahead(lunch, 0, 1),
+          "11:29 -> 13:01 被当成 1 分钟持有期")
+
+    # 跨日更不行
+    cross_day = [{"t": "2026-11-03 14:59", "price": 4.0},
+                 {"t": "2026-11-04 09:30", "price": 4.0}]
+    check(not analyze.same_session_ahead(cross_day, 0, 1), "跨日样本被当成 1 分钟")
+
+    # 中位数：偶数样本取中间两个的均值，旧写法直接取偏大的那个
+    check(analyze._median([1, 2, 3]) == 2, "奇数样本中位数算错")
+    check(abs(analyze._median([1, 2, 3, 4]) - 2.5) < 1e-9,
+          "偶数样本中位数该是 2.5，旧写法会给 3")
+
+    # 一整天都凑不出一个样本的短分时，不能被当成「可用但没信号」
+    check(analyze.MIN_TICKS == 22 + max(analyze.HORIZONS) + 1,
+          "MIN_TICKS 应与 22 预热 + 最长持有期 + 1 对齐，实际 %d" % analyze.MIN_TICKS)
+    check(len(range(22, analyze.MIN_TICKS - 1 - max(analyze.HORIZONS))) == 0,
+          "MIN_TICKS-1 根的日子仍能进循环，门槛定低了")
+
+
+@case("推送守卫：只差换行符不算「改了没提交」")
+def t_push_same_content():
+    """core.autocrlf=true 时磁盘是 CRLF、git 里存 LF，字节永远不相等。
+
+    旧守卫拿 disk != head 当「改了没提交」，于是同一个文件被 git 检出
+    一遍之后就被判成脏的——默认模式对任何文件都拒绝推送，真正该拦的
+    情况（内容真的不同）反而被这堆假警报淹没。2026-11-04 实测 selftest.py
+    磁盘 1202 个 CRLF、HEAD 里 0 个，而 git diff 是空的。
+    """
+    crlf = bytes([13, 10])
+    lf = bytes([10])
+    check(push_repo.same_content(b"a" + crlf + b"b" + crlf,
+                                 b"a" + lf + b"b" + lf),
+          "只差换行符被判成了内容不同")
+    check(not push_repo.same_content(b"a" + lf + b"b" + lf,
+                                     b"a" + lf + b"c" + lf),
+          "内容真的不同却被放行，会把旧版本推上去")
+    check(push_repo.same_content(None, None), "两边都没有应算一致")
+    check(not push_repo.same_content(None, b"x"), "一边有一边没有不算一致")
 
 
 if __name__ == "__main__":

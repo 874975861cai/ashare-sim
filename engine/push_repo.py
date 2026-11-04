@@ -113,6 +113,22 @@ def worktree_bytes(path):
         return None
 
 
+def same_content(a, b):
+    """两份字节是否只差换行符（CRLF vs LF）。
+
+    为什么要单独判：本机 core.autocrlf=true，工作区是 CRLF、git 里存的是 LF，
+    所以「磁盘字节 != HEAD 字节」是常态，不等于「改了没提交」。旧守卫把两者
+    当成同一件事，于是 git 每检出一遍之后，默认模式对所有文件都报
+    「工作区内容和 HEAD 不一致，拒绝推送」——真正该拦的情况反而被淹没；
+    而按提示改用 --worktree 又会把 CRLF 推上去，下次比对又永远不等。
+    2026-11-04 实测：selftest.py 磁盘 1202 个 CRLF、HEAD 里 0 个，diff 为空。
+    """
+    if a is None or b is None:
+        return a is b
+    crlf, lf = bytes([13, 10]), bytes([10])
+    return a.replace(crlf, lf) == b.replace(crlf, lf)
+
+
 def main(argv):
     ap = argparse.ArgumentParser()
     ap.add_argument("files", nargs="*")
@@ -163,7 +179,7 @@ def main(argv):
                 raise SystemExit("git 里没有这个文件：%s" % path)
             dirty.append("%s（从未提交过）" % path)
             continue
-        if disk is not None and disk != head:
+        if disk is not None and not same_content(disk, head):
             dirty.append(path)
             continue
         payload[path] = head
