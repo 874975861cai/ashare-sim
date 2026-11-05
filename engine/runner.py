@@ -297,6 +297,17 @@ def run(verbose=True, params=None, execute=True, ttl=600):
 
     idx = {c: {t["t"]: k for k, t in enumerate(tr["ticks"])} for c, tr in data.items()}
     ctx = {"trades": 0, "market_pct": 0.0, "preclose": None}
+
+    # 大盘涨跌按「决策分钟」前向填充：decide 读的是 ticks[k-1]，用第 i 分钟
+    # 的价就等于提前一分钟看到还没发生的下跌（前视）。回测里 2026-11-05 实测
+    # 复现过同一处：09:59 才崩的指数，09:58 的决策里已经算进去了。
+    mkt_ticks = data["510300"]["ticks"] if "510300" in idx else []
+    asof_pct, last_pct, mi = {}, 0.0, 0
+    for tt in tlist:
+        while mi < len(mkt_ticks) and mkt_ticks[mi]["t"] <= tt:
+            last_pct = (mkt_ticks[mi]["price"] / mkt_pre - 1) * 100
+            mi += 1
+        asof_pct[tt] = last_pct
     pos = None
     events = []
 
@@ -328,9 +339,9 @@ def run(verbose=True, params=None, execute=True, ttl=600):
     for i, t in enumerate(tlist):
         tm = t[11:16]
         dt = datetime.strptime(t, "%Y-%m-%d %H:%M")
-        if "510300" in idx and t in idx["510300"]:
-            mk = data["510300"]["ticks"][idx["510300"][t]]["price"]
-            ctx["market_pct"] = (mk / mkt_pre - 1) * 100
+        # 大盘涨跌不再在这里更新：它必须与「决策那一根」对齐（见上面的 asof_pct）。
+        # 原来的写法用第 i 分钟的指数价，而 decide 读 ticks[k-1]，等于让 R6
+        # 提前一分钟看到还没发生的下跌——回测里同一个错 2026-11-05 已实测复现。
 
         # --- 持仓管理 ---
         if pos:
@@ -345,6 +356,7 @@ def run(verbose=True, params=None, execute=True, ttl=600):
                 k = len(ticks) - 1
             if k >= 1:
                 pctx = dict(ctx)
+                pctx["market_pct"] = asof_pct.get(ticks[k - 1]["t"], 0.0)
                 pctx["preclose"] = data[c]["preclose"] or ticks[0]["price"]
                 # 「能不能卖」和「该不该卖」是两件事：
                 # 股票型 ETF 是 T+1，当天买入的份额当天卖不掉；
@@ -429,6 +441,7 @@ def run(verbose=True, params=None, execute=True, ttl=600):
             if params.get("mode") != "hold" and k < 22:
                 continue
             cctx = dict(ctx)
+            cctx["market_pct"] = asof_pct.get(tr["ticks"][k - 1]["t"], 0.0)
             cctx["preclose"] = tr["preclose"] or tr["ticks"][0]["price"]
             act, reason, detail = strategy.decide(tr["ticks"], k - 1, None, cctx, params)
             if act == "BUY":

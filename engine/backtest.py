@@ -129,7 +129,10 @@ def dataset_health(data, ndays=5):
     n = len(data)
     coverage = [(d, sum(1 for v in data.values() if d in v["days"])) for d in days]
     half = max(2, (n + 1) // 2)
-    thin = [(d, k) for d, k in coverage if k < half]
+    # 只有一只标的时「横截面」这件事不存在，任何一天都是 1/1。旧写法仍按
+    # 「不足半数」判（1 < 2），于是单标的回测天天报「窗口是拼出来的」——
+    # 一个只会制造假警报的告警，久了就会被忽略。
+    thin = [] if n <= 1 else [(d, k) for d, k in coverage if k < half]
     return {"codes": n, "days": days, "span": len(days), "ndays": ndays,
             "coverage": coverage, "thin": thin}
 
@@ -227,11 +230,30 @@ def run_backtest(data, params, days, capital=10000.0, verbose=False):
     for day in days:
         # 隔夜仓：昨天买入的 T+1 标的，今天才解锁。
         # entry_idx 记的是"当天第几根分钟线"，昨天的索引放到今天没有意义，
-        # 置 -1 等价于「一开盘就已超过持有上限」，即次日开盘按市价了结。
+        # 所以重置为 0（= 今日第一根，与 runner 的续管口径一致），随后由
+        # strategy 的持有期规则把「隔夜持有到次日早盘平仓」这条路走完。
+        # 曾经写成 -1，注释还宣称「一开盘就已超过持有上限」——实际 hold 算的是
+        # i - (-1)，要等到开盘后第 20 根才触发时间止损，比 runner 早一根，
+        # 而且注释描述的是一种没有发生的行径。2026-11-05 实测：11-03 09:56 建仓，
+        # 11-04 09:50 才平（runner 是 09:51），差的正是这一根的错位。
         if pos and pos.get("day") != day:
-            pos["entry_idx"] = -1
+            pos["entry_idx"] = 0
             pos["overnight"] = True
         ctx = {"trades": 0, "market_pct": 0.0, "preclose": None}
+        # 持有型：目标今天压根没法买，这件事必须在开盘前就记一笔。
+        # 为什么放在分钟循环外：如果全池当日都没有 tick，tlist 是空的，
+        # 循环体一次都不会执行——写在里面的留痕永远不会触发（2026-11-05 实测，
+        # 造一个 510880 停牌日，回测整天不动、blocked 依然是空的）。
+        # 两种「买不了」不能混成一句：标的根本不在池子里（缺数据）vs 池里有它
+        # 但当天整日没有分时（停牌）。两者都是数据事实，不是「策略今天不想买」。
+        if hold_tgt and not pos:
+            if hold_tgt not in data:
+                note_block(day, hold_tgt, "BUY", "", "持有型标的缺数据，本日不建仓",
+                           tag="hold_target")
+            elif day not in data[hold_tgt]["days"]:
+                note_block(day, hold_tgt, "BUY", "",
+                           "持有型标的当日无分时（停牌或缺数据），本日不建仓",
+                           tag="hold_target_day")
         # 时间轴：取当日所有标的的时间并集（同一交易时段，基本一致）
         tl = set()
         for v in data.values():
@@ -244,18 +266,27 @@ def run_backtest(data, params, days, capital=10000.0, verbose=False):
             if day in v["days"]:
                 idxmap[c] = {t["t"]: k for k, t in enumerate(v["days"][day])}
 
+        # 大盘涨跌：按「决策分钟」取当时已知的最新指数价（前向填充）。
+        # 旧写法在循环顶上用第 i 分钟的价算 market_pct，而决策读的是 ticks[k-1]
+        # ——两者差一分钟，等于让 R6 熔断提前一分钟看到还没发生的下跌。
+        # 2026-11-05 实测：让 510300 在 11-04 09:59 才崩，09:58 那一格的决策里
+        # market_pct 已经是 -2.94%。影响面只到日内入场过滤（持有型不读它），
+        # 但「防未来函数」这条约定不能只在 docstring 里成立。
+        asof_pct, last_pct = {}, 0.0
+        mpre = (data[mkt]["preclose"].get(day)
+                if mkt and day in data[mkt]["days"] else None)
+        mticks = data[mkt]["days"][day] if mpre else []
+        mi = 0
+        for tt in tlist:
+            while mi < len(mticks) and mticks[mi]["t"] <= tt:
+                if mpre:
+                    last_pct = (mticks[mi]["price"] / mpre - 1) * 100
+                mi += 1
+            asof_pct[tt] = last_pct
+
         for i, t in enumerate(tlist):
-            tm = t[11:16]
             if i == 0:
                 continue
-
-            # 大盘涨跌：和 runner 一样逐分钟更新，否则 R6 熔断在回测里形同虚设
-            if mkt and day in data[mkt]["days"]:
-                mk = idxmap.get(mkt, {}).get(t)
-                mpre = data[mkt]["preclose"].get(day)
-                if mk is not None and mpre:
-                    ctx["market_pct"] = (data[mkt]["days"][day][mk]["price"]
-                                         / mpre - 1) * 100
 
             # 持仓：出场判定
             if pos:
@@ -267,6 +298,7 @@ def run_backtest(data, params, days, capital=10000.0, verbose=False):
                         continue
                     # 用 k-1 决策，k 成交
                     pctx = dict(ctx)
+                    pctx["market_pct"] = asof_pct.get(ticks[k - 1]["t"], 0.0)
                     pctx["preclose"] = data[c]["preclose"][day]
                     can_sell = bool(pos.get("overnight")) or broker.is_t0_etf(c)
                     act, reason, detail = strategy.decide(
@@ -309,10 +341,8 @@ def run_backtest(data, params, days, capital=10000.0, verbose=False):
             if pause_until and day < pause_until:
                 continue
             if hold_tgt and hold_tgt not in data:
-                # 持有型标的缺数据 = 今日不建仓。以前这里什么都不做，
-                # 「标的没数据」和「策略决定不买」看起来一模一样。
-                note_block(day, hold_tgt, "BUY", t if tlist else "",
-                           "持有型标的缺数据，本日不建仓", tag="hold_target")
+                # 留痕已在当日开盘前统一记过（见上面 day 级检查），这里只是
+                # 跳过扫描：全池只有 hold_target 可买，它不在就没有候选。
                 continue
             best = None
             for c, v in data.items():
@@ -332,6 +362,7 @@ def run_backtest(data, params, days, capital=10000.0, verbose=False):
                 if params.get("mode") != "hold" and k < 22:
                     continue
                 cctx = dict(ctx)
+                cctx["market_pct"] = asof_pct.get(ticks[k - 1]["t"], 0.0)
                 cctx["preclose"] = v["preclose"][day]
                 act, reason, detail = strategy.decide(ticks, k - 1, None, cctx, params)
                 if act == "BUY":
@@ -436,8 +467,10 @@ def metrics(res, capital=10000.0):
         "trades": n,
         "win_rate": round(len(wins) / n * 100, 1) if n else 0.0,
         "avg_pnl": round(sum(t["pnl"] for t in sells) / n, 2) if n else 0.0,
-        "best": round(max([t["pnl"] for t in sells], default=0), 2),
-        "worst": round(min([t["pnl"] for t in sells], default=0), 2),
+        # 0 笔时返回 None，不返回 0.00：一笔没成交和「最好那笔刚好打平」
+        # 在报告里长得一模一样，而前者是「没样本」，后者是「有样本但为 0」。
+        "best": round(max(t["pnl"] for t in sells), 2) if sells else None,
+        "worst": round(min(t["pnl"] for t in sells), 2) if sells else None,
         # 回放窗口结束时还握着仓位：ret_pct 里含着未平仓市值，不能当成
         # 「已实现收益」看。以前这个信息只藏在 res 里，metrics 一取就没了，
         # 报告读起来像「1 笔完整往返」，实际是「1 笔买入 + 1 笔从未离场」。

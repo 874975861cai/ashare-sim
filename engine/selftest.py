@@ -699,6 +699,111 @@ def t_strategy_changed():
               "重放改写了现金：%.2f → %.2f" % (before["cash"], after["cash"]))
 
 
+@case("回测：大盘涨跌要和决策同一分钟，不能提前一分钟看到下跌")
+def t_bt_market_pct_no_lookahead():
+    """2026-11-05 发现：ctx["market_pct"] 取的是「成交那一分钟」的指数价，
+    而 decide 读的是 ticks[k-1]，于是 09:58 的决策里已经含着 09:59 的暴跌。
+
+    实测：让 510300 在 09:59 才崩到 -2.94%，09:58 那一格的 market_pct
+    就已经是 -2.94%。这里改成每分钟涨 0.1%，每一分钟的 market_pct 都唯一，
+    再逐条核对「决策那一刻看到的数」是否等于「那一分钟的指数价」。
+    """
+    n = 30
+    d1, d2 = "2026-10-19", "2026-10-20"
+    idx_px = [3.40 * (1 + 0.001 * k) for k in range(n)]
+    data = {
+        "510300": {"name": "沪深300ETF",
+                   "days": {d1: mk_ticks(d1, flat_prices(5, 3.40)),
+                            d2: mk_ticks(d2, idx_px)},
+                   "preclose": {d1: 3.40, d2: 3.40}, "first_day_no_preclose": d1},
+        "510880": {"name": "红利ETF",
+                   "days": {d1: mk_ticks(d1, flat_prices(5, 3.40)),
+                            d2: mk_ticks(d2, flat_prices(n, 3.40))},
+                   "preclose": {d1: 3.40, d2: 3.40}, "first_day_no_preclose": d1},
+    }
+    seen = []
+
+    def spy(ticks, i, pos, ctx, params=strategy.PARAMS, can_sell=True):
+        if ctx.get("preclose"):
+            seen.append((ticks[i]["t"], round(ctx.get("market_pct", 0.0), 4)))
+        return "HOLD", "", {}
+
+    old = strategy.decide
+    strategy.decide = spy
+    try:
+        backtest.run_backtest(data, dict(strategy.PARAMS, mode="daytrade",
+                                         entry_enabled=True), [d1, d2])
+    finally:
+        strategy.decide = old
+
+    expect = {t["t"]: round((t["price"] / 3.40 - 1) * 100, 4)
+              for t in data["510300"]["days"][d2]}
+    check(seen, "用例没触发任何决策点")
+    bad = [(t, p, expect[t]) for t, p in seen
+           if t in expect and abs(p - expect[t]) > 1e-6]
+    check(not bad, "决策看到的大盘涨跌不是同一分钟（决策时刻, 看到, 应为）：%s"
+                   % bad[:3])
+
+
+@case("回测：持有型标的当日停牌不能静默不建仓")
+def t_bt_hold_target_suspended():
+    """池子里有这只、但这一天整日没有一根 tick（停牌 / 数据缺口）。
+
+    以前回测整天不动、blocked 为空，报告读起来就是「策略今天不想买」。
+    注意这两个字要分得清：缺数据（不在池里）vs 停牌（在池里但没 tick）。
+    """
+    n = len(session_minutes())
+    d1, d2 = "2026-10-19", "2026-10-20"
+
+    def mk(day, px):
+        return mk_ticks(day, flat_prices(n, px))
+
+    # 510880 只有 d2 有数据，d1 整日停牌
+    data = {"510880": {"name": "红利ETF", "days": {d2: mk(d2, 3.5)},
+                       "preclose": {d1: 3.5, d2: 3.5},
+                       "first_day_no_preclose": d1}}
+    p = dict(strategy.PARAMS, mode="hold", hold_target="510880")
+    r = backtest.run_backtest(data, p, [d1, d2])
+    buys = [t for t in r["trades"] if t["side"] == "BUY"]
+    check(len(buys) == 1 and buys[0]["day"] == d2,
+          "停牌日不该建仓：%s" % [(t["day"], t["side"]) for t in r["trades"]])
+    rec = [b for b in r["blocked"] if b["day"] == d1]
+    check(rec, "停牌日没有留痕，等于把「没数据」报成「策略不买」")
+    check("停牌" in rec[0]["reason"], "留痕原因不清楚：%s" % rec[0]["reason"])
+
+
+@case("策略：时间止损按真实分钟，不按第几根K线")
+def t_hold_minutes_not_bars():
+    """跨午休时 11:30 与 13:01 在索引上相邻，实际差 91 分钟。
+
+    「持有 20 分钟」若按索引算，11:25 建仓要拖到 13:15 才触发（真实 110 分钟），
+    日志上却仍写着「时间止损(20分钟)」。analyze.py 2026-11-04 抓到同一类错
+    （60 分档里 8 个样本实际是 150 分钟），这里是它的上游。
+    """
+    mins = []
+    for h, m0, m1 in ((11, 0, 30), (13, 0, 60)):
+        for m in range(m0, m1):
+            mins.append((h, m))
+    d = "2026-10-19"
+    ticks = [{"t": "%s %02d:%02d" % (d, h, m), "price": 3.40,
+              "vol": 100.0, "avg": 3.40} for h, m in mins]
+    ctx = {"trades": 0, "market_pct": 0.0, "preclose": 3.40}
+    p = dict(strategy.PARAMS, mode="daytrade", entry_enabled=True,
+             max_hold_min=20, take_profit=0.5, stop_loss=0.5)
+
+    # 不跨午休的对照：11:00 建仓，11:10 才持有 10 分钟 → 不该平
+    a = strategy.decide(ticks, 10, {"entry": 3.40, "entry_idx": 0}, dict(ctx), p)
+    check(a[0] == "HOLD", "持有 10 分钟就触发了时间止损：%s" % (a,))
+    b = strategy.decide(ticks, 20, {"entry": 3.40, "entry_idx": 0}, dict(ctx), p)
+    check(b[0] == "SELL" and "时间止损" in b[1], "持有 20 分钟该平：%s" % (b,))
+
+    # 跨午休：11:25 建仓，13:00 已经真实持有 95 分钟 → 必须平（索引差只有 5）
+    c = strategy.decide(ticks, 30, {"entry": 3.40, "entry_idx": 25}, dict(ctx), p)
+    check(c[0] == "SELL" and "时间止损" in c[1],
+          "跨午休的持有期还在按 K 线根数算：%s" % (c,))
+    check("95分钟" in c[1], "持有分钟数报错了：%s" % c[1])
+
+
 @case("无未来函数：决策不看 i 之后的数据")
 def t_no_future():
     day = "2026-10-19"

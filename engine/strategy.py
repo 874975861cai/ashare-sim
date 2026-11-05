@@ -10,6 +10,8 @@
   当偏离 VWAP 超过一定阈值且出现动量拐头时，回归概率占优。
 """
 
+from datetime import datetime
+
 # ---------------- 默认参数（v1.2 数据校准 + 路径验证后） ----------------
 # 校准依据：engine/analyze.py 信号生存分析 + engine/backtest.py 路径回放
 #   dev 0.55% -> 5min 胜率 48.8%（噪音，已废弃）
@@ -196,6 +198,33 @@ def hhmm(t):
     return t[11:16]
 
 
+def held_minutes(ticks, entry_idx, i):
+    """从入场那一根到当前这一根，实际过去了多少分钟。
+
+    为什么不能直接用 i - entry_idx：只有连续竞价时段内索引才等于分钟数。
+    跨午休时 11:30 与 13:01 在索引上相邻，实际差 91 分钟——「持有 20 分钟」
+    会在 11:25 建仓后一路拖到 13:20 才触发（真实持有 115 分钟），而日志上
+    仍写着「时间止损(20分钟)」。2026-11-04 在 analyze.py 里抓到同一类错
+    （60 分档 40 个样本里 8 个实际是 150 分钟），这里是它的上游。
+    entry_idx < 0 是「隔夜续管」的老约定，按今日第一根算（同 runner）。
+    """
+    try:
+        k0 = int(entry_idx)
+    except (TypeError, ValueError):
+        k0 = 0
+    if k0 < 0:
+        k0 = 0
+    try:
+        a = ticks[k0]["t"]
+        b = ticks[i]["t"]
+        d = (datetime.strptime(b, "%Y-%m-%d %H:%M")
+             - datetime.strptime(a, "%Y-%m-%d %H:%M"))
+        return int(d.total_seconds() // 60)
+    except (KeyError, IndexError, TypeError, ValueError):
+        # 时间戳坏了就退回索引差：宁可少一分精度，也不要抛异常把整轮回放打断
+        return i - k0
+
+
 def at(ticks, i):
     """取第 i 个点的收盘信息（i 从 0 开始）。"""
     p = ticks[i]
@@ -265,7 +294,8 @@ def decide(ticks, i, pos, ctx, params=PARAMS, can_sell=True):
             # 只能等下一个交易日。这里必须明说，不能假装"HOLD 是策略选择"。
             return "HOLD", "", {"locked": True}
         entry = pos["entry"]
-        hold = i - pos["entry_idx"]
+        # 持有期按真实分钟算，不按「第几根 K 线」算（跨午休会差 90 分钟）
+        hold = held_minutes(ticks, pos.get("entry_idx"), i)
         pnl = price / entry - 1
         if pnl >= params["take_profit"]:
             return "SELL", f"止盈(+{pnl*100:.2f}%)", {"pnl": pnl, "hold": hold}
