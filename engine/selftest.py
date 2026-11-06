@@ -43,6 +43,9 @@ import strategy    # noqa: E402
 
 VERBOSE = False
 CASES = []
+# 用例总数基线（见 main() 里的说明：少了要红，不是"通过 41 项"）。
+# 2026-10-19 建 1 条起算，每加一条用例都要同步改这里。
+EXPECTED_CASES = 42
 
 
 def case(name):
@@ -350,9 +353,15 @@ def t_buy_shares_type():
         check(broker.load_account()["cash"] == cash, "被拒的买入动过现金")
         r = broker.buy(acc, "510300", "a", 4.0, 100.0, dt)
         check(r["shares"] == 100, "整数值 float 被误拒或归一失败：%r" % (r["shares"],))
+        # 归一必须落到账本上：旧实现会把 100.0 原样写进 lots，
+        # 于是一个「份数」在账户里是 float，之后任何 int 比较都要靠运气。
+        lot = broker.load_account()["positions"]["510300"]["lots"][0]
+        check(type(lot["shares"]) is int,
+              "账本里的份数不是 int：%r" % (lot["shares"],))
 
 
-
+@case("分时：盘后 tick（15:05+）必须裁掉")
+def t_trim_afterhours():
     """东财 ETF 分时含 15:05-15:30 的盘后固定价格成交（实测 2026-10-22
     588000/510300/159915 三只最后一根都落在 15:30）。
 
@@ -909,6 +918,20 @@ def main():
     print("=" * 70)
     print("  端到端自测   %s" % datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     print("=" * 70)
+    # 用例总数是硬基线，必须等于 EXPECTED_CASES。2026-11-06 的真实事故：
+    # 一次编辑吞掉了某条用例的 `@case(...)` 和 `def` 两行，函数体退化成
+    # 上一支用例的尾巴——**编译通过、导入通过、跑完不报错**，这条用例就此
+    # 消失。自测照旧「全部通过」，只是从 42 变成 41，而 doctor 只数 [PASS]，
+    # 它没有任何办法知道"应该有 42 个"。**少一条比红一条危险得多**。
+    # 所以这里钉死数量：故意增删用例时，改这个常数就是一次显式确认。
+    if len(CASES) != EXPECTED_CASES:
+        print("  [FAIL] 用例登记：应有 %d 条，实际注册 %d 条（用例被吞或未登记）"
+              % (EXPECTED_CASES, len(CASES)))
+        print("-" * 70)
+        print("  通过 0 / %d" % EXPECTED_CASES)
+        print("  失败 1 项")
+        print("=" * 70)
+        return 1
     passed, failed = 0, []
     for name, fn in CASES:
         try:
