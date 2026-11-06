@@ -277,8 +277,82 @@ def t_sell_invalid_shares():
               % (cash, broker.load_account()["cash"]))
 
 
-@case("分时：盘后 tick（15:05+）必须裁掉")
-def t_trim_afterhours():
+@case("涨跌停价：四舍五入按交易所口径，封板不误拒")
+def t_limit_half_up():
+    """内置 round() 是银行家舍入，交易所规则是四舍五入——差一档就会误拒。
+
+    实例：510300 昨收 2.335，涨停价 = 2.335 × 1.1 = 2.5685 → 交易所取 2.569。
+    旧代码 `round(2568.5)` 取偶给 2.568，于是「报价 2.568、买方吃一档到 2.569」
+    这笔**正好封在涨停价上**的真实成交，被判成「吃一档后 2.569 超过涨停价 2.568」
+    而拒单——方向保守，但它是错单：本可以在涨停价成交的仓位没了。
+    跌停侧同理（3.045 × 0.9 = 2.7405 → 2.741，旧代码给 2.740）。
+    """
+    up, down = broker.limit_prices("510300", 2.335)
+    check(up == 2.569, "ETF 涨停价算错：%s，应为 2.569" % up)
+    check(down == 2.102, "ETF 跌停价算错：%s，应为 2.102" % down)
+
+    # 股票按 0.01 取整：10.15 × 1.1 = 11.165 → 11.17（旧代码 11.16）
+    up, down = broker.limit_prices("600000", 10.15)
+    check(up == 11.17, "股票涨停价算错：%s，应为 11.17" % up)
+    check(down == 9.14, "股票跌停价算错：%s，应为 9.14" % down)
+
+    # 行为验证：报价 2.568 → 吃一档 2.569 恰好等于涨停价，必须成交
+    with sandbox():
+        acc = broker.load_account()
+        dt = datetime(2026, 10, 19, 10, 0)
+        r = broker.buy(acc, "510300", "沪深300ETF", 2.568, 100, dt, preclose=2.335)
+        check(r["price"] == 2.569, "涨停价上的成交价不对：%s" % r["price"])
+        # 而报价 2.569 再吃一档 2.570 就越过涨停价，封板拒单是对的
+        try:
+            broker.buy(acc, "510300", "沪深300ETF", 2.569, 100, dt, preclose=2.335)
+        except broker.Reject as e:
+            check("封板" in str(e), "拒绝理由不是封板：%s" % e)
+        else:
+            check(False, "越过涨停价的成交竟然通过了")
+
+
+@case("涨跌幅限制：创业板/科创板 ST 仍是 20%，只有主板 ST 是 5%")
+def t_limit_ratio_board():
+    """2020 年创业板注册制后，《创业板交易特别规定》把创业板股票
+    （含风险警示股票）的涨跌幅统一为 20%；科创板同理。
+
+    旧代码先判 `"ST" in name` 再判板块，创业板 ST 被算成 5%：涨停价按
+    昨收 ×1.05 封，实际可以涨到 1.20 —— 池子换成创业板个股后，一笔
+    20% 涨停日的合法买入会被拒，跌停价则会算高一倍，凭空报出「已跌停」。
+    """
+    check(broker.limit_ratio("300750", "ST宁德") == 0.20, "创业板 ST 应为 20%")
+    check(broker.limit_ratio("301001", "*ST某某") == 0.20, "创业板 ST 应为 20%")
+    check(broker.limit_ratio("688001", "ST科创") == 0.20, "科创板 ST 应为 20%")
+    check(broker.limit_ratio("600000", "ST某某") == 0.05, "主板 ST 应为 5%")
+    check(broker.limit_ratio("830799", "ST北交") == 0.30, "北交所风险警示股应为 30%")
+    check(broker.limit_ratio("510300", "沪深300ETF") == 0.10, "宽基 ETF 应为 10%")
+    check(broker.limit_ratio("159915", "创业板ETF") == 0.20, "创业板 ETF 应为 20%")
+
+
+@case("买入数量：小数股/布尔被拒，整数 float 归一")
+def t_buy_shares_type():
+    """`shares=100.5` 曾被 `% 100` 放过去，账本里出现半份持仓，
+    之后所有成本、可卖数量、估值全部跟着脏；`True` 更隐蔽（bool 是 int）。
+    runner 里 `int(budget / px / 100) * 100` 本身是 int，但 100.0 这种
+    整数值 float 不该被拒——两种都要覆盖。
+    """
+    with sandbox():
+        acc = broker.load_account()
+        dt = datetime(2026, 10, 19, 10, 0)
+        cash = acc["cash"]
+        for bad in (100.5, True, 0, -100):
+            try:
+                broker.buy(acc, "510300", "a", 4.0, bad, dt)
+            except broker.Reject:
+                pass
+            else:
+                raise AssertionError("%r 买入竟然成交" % (bad,))
+        check(broker.load_account()["cash"] == cash, "被拒的买入动过现金")
+        r = broker.buy(acc, "510300", "a", 4.0, 100.0, dt)
+        check(r["shares"] == 100, "整数值 float 被误拒或归一失败：%r" % (r["shares"],))
+
+
+
     """东财 ETF 分时含 15:05-15:30 的盘后固定价格成交（实测 2026-10-22
     588000/510300/159915 三只最后一根都落在 15:30）。
 

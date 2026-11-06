@@ -1352,7 +1352,21 @@ def check_backtest_baseline():
         return
 
     drift = abs(ret - float(base.get("ret_pct", 0)))
+    now_code = _code_sig()
+    if drift <= 0.05 and n == base.get("trades") and base.get("code") != now_code:
+        # 结果没变、但回测代码变了：指纹必须当场刷新。
+        # 不刷新的话，这个旧指纹会一直躺到下一个数据集滚动日，那天闸门比
+        # 「旧指纹 ≠ 新指纹」，报「数据集与代码同时变更、无法区分」——而我们
+        # 此刻明明就站在能区分的位置上：同一份数据、同一个窗口、结果一模一样。
+        # 2026-11-06 就是这样：改了 broker 的涨跌停取整，探针仍是 -3.55% / 0 笔，
+        # 若不刷新，11-07 滚动日会凭空多一条假警报。
+        save()
+        add(OK, "回归", "回测基线",
+            "探针 %.2f%% / %d 笔与基线一致；回测代码指纹已刷新 %s → %s（结果未变，"
+            "属等价改写）%s" % (ret, n, base.get("code") or "未记录", now_code, tail))
+        return
     if drift > 0.05 or n != base.get("trades"):
+
         add(WARN, "回归", "回测基线",
             "结果漂移：探针 %.2f%%→%.2f%%，%d→%d 笔（同一份数据、参数指纹 %s 未变，"
             "所以是代码行为变了）%s"

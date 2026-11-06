@@ -22,6 +22,7 @@ import io
 import json
 import os
 from datetime import datetime
+from decimal import Decimal, ROUND_HALF_UP
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATE = os.path.join(BASE, "state")
@@ -61,9 +62,28 @@ def price_tick(code):
     return 0.001 if is_etf(code) else 0.01
 
 
+def _half_up(value, tick):
+    """按交易所口径把价格四舍五入到最小价格变动单位的整数倍。
+
+    不能用内置 `round()`：它是「银行家舍入」（.5 靠偶数），而沪深交易所
+    《交易规则》对涨跌幅价格的规定是「四舍五入至最小价格变动单位」。
+    实测 510300 昨收 2.335 时，涨停价应为 2.569，`round()` 给 2.568
+    （2.5685 落在 2568.5，取偶）——差这一档，就会把「报价 2.568、
+    吃一档后 2.569 正好封在涨停价上」的真实成交判成「超过涨停价」。
+
+    而且必须全程走 Decimal：2.335 * 1.1 在浮点里是 2.5685000000000002，
+    3.045 * 0.9 是 2.7405000000000004，拿这种数去 round 只会把半档的
+    误差随机放大。
+    """
+    q = Decimal(str(tick))
+    n = (Decimal(str(value)) / q).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    return n * q
+
+
 def round_price(code, p):
     t = price_tick(code)
-    return round(round(float(p) / t) * t, 3 if t == 0.001 else 2)
+    v = _half_up(p, t)
+    return round(float(v), 3 if t == 0.001 else 2)
 
 
 # 跟踪创业板/科创板指数的 ETF，涨跌幅限制是 20%，不是 10%。
@@ -87,25 +107,35 @@ def _is_20pct_etf(code, name=""):
 
 
 def limit_ratio(code, name=""):
-    """涨跌幅限制比例。"""
+    """涨跌幅限制比例。
+
+    顺序是有讲究的：**板块先于 ST**。
+    2020 年创业板注册制改革后，《深圳证券交易所创业板交易特别规定》把创业板
+    股票（**含风险警示股票**）的涨跌幅统一为 20%；科创板同理。主板 ST 才是 5%。
+    原来先判 `"ST" in name` 再判板块，创业板/科创板 ST 会被当成 5%，
+    涨停价被算低三分之二、跌停价算高——不是拒掉合法成交，就是凭空造出
+    「已经跌停」的假信号。北交所没有 5% 档，风险警示股仍是 30%。
+    """
     code = str(code)
-    if "ST" in str(name).upper():
-        return 0.05
-    if code.startswith(("300", "301", "688", "689")):
-        return 0.20
-    if code.startswith(("8", "4", "92")):      # 北交所
+    if code.startswith(("8", "4", "92")):      # 北交所（含风险警示股，一律 30%）
         return 0.30
+    if code.startswith(("300", "301", "688", "689")):   # 创业板/科创板，含 ST
+        return 0.20
+    if "ST" in str(name).upper():              # 只有主板 ST 是 5%
+        return 0.05
     if is_etf(code) and _is_20pct_etf(code, name):
         return 0.20
     return 0.10
 
 
 def limit_prices(code, preclose, name=""):
-    r = limit_ratio(code, name)
+    r = Decimal(str(limit_ratio(code, name)))
+    base = Decimal(str(preclose))
     t = price_tick(code)
-    up = round(preclose * (1 + r) / t) * t
-    down = round(preclose * (1 - r) / t) * t
-    return round(up, 3 if t == 0.001 else 2), round(down, 3 if t == 0.001 else 2)
+    up = _half_up(base * (1 + r), t)
+    down = _half_up(base * (1 - r), t)
+    nd = 3 if t == 0.001 else 2
+    return round(float(up), nd), round(float(down), nd)
 
 
 def in_trading_session(dt):
@@ -292,7 +322,14 @@ def buy(acc, code, name, price, shares, dt, reason="", preclose=None):
     code = str(code)
     if not in_trading_session(dt):
         raise Reject("非连续竞价时段")
-    if shares <= 0 or shares % 100 != 0:
+    # 与 sell 对齐：整数值的 float 先归一化（100.0 是 runner 里除法的天然产物，
+    # 不该拒），真正的小数股/布尔值才拒。否则 100.5 会被 `% 100` 放过去，
+    # 账本里就出现半份持仓，后面所有成本、可卖数量、估值全跟着脏。
+    if isinstance(shares, float) and shares.is_integer():
+        shares = int(shares)
+    if isinstance(shares, bool) or not isinstance(shares, int) or shares <= 0:
+        raise Reject(f"买入数量必须为正整数，当前 {shares!r}")
+    if shares % 100 != 0:
         raise Reject(f"买入必须为100的整数倍，当前 {shares}")
     # 持仓上限必须在这里挡。runner 用局部变量 pos 记当前仓位，
     # 一旦开盘就有过夜仓，那个 pos 仍是 None，于是它会在已有持仓上再开一只。
