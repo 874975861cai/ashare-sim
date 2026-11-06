@@ -45,7 +45,7 @@ VERBOSE = False
 CASES = []
 # 用例总数基线（见 main() 里的说明：少了要红，不是"通过 41 项"）。
 # 2026-10-19 建 1 条起算，每加一条用例都要同步改这里。
-EXPECTED_CASES = 42
+EXPECTED_CASES = 44
 
 
 def case(name):
@@ -907,6 +907,79 @@ def t_no_future():
 def t_doctor_selftest():
     fails = doctor.selftest_replay()
     check(not fails, "检查器自测失败：%s" % fails)
+
+
+@case("护栏：改任何一个策略参数都必须让当日指纹变，否则会前视重放")
+def t_params_sig_covers_every_key():
+    """2026-11-07 的真实漏洞：指纹用的是手写白名单，漏了 hold_cooldown_days /
+    min_amount / min_price——三个真影响成交的参数。改了它们，当日护栏不响，
+    引擎会拿新参数把当天从 09:30 重放一遍（用早盘价格执行刚刚才做出的决定）。
+    这里逐个扰动 PARAMS 的每一个键：只要有一个键扰动后指纹不变，就是漏网。"""
+    base = dict(strategy.PARAMS)
+
+    def mutate(v):
+        if isinstance(v, bool):
+            return not v
+        if isinstance(v, (int, float)):
+            return v + 1
+        if isinstance(v, str):
+            return v + "_x"
+        return "__changed__"
+
+    ref = runner.params_sig(base)
+    missed = []
+    for k, v in base.items():
+        p = dict(base)
+        p[k] = mutate(v)
+        if runner.params_sig(p) == ref:
+            missed.append(k)
+    check(not missed, "这些参数改了但当日指纹不变（护栏会放行前视重放）：%s" % missed)
+    # 键顺序不该影响指纹（dict 排序后哈希），否则改一处书写顺序就白停一天
+    rev = {k: base[k] for k in reversed(list(base))}
+    check(runner.params_sig(rev) == ref, "指纹受键顺序影响了，等价参数会误拦")
+
+
+@case("云端退出码：没报价=3、有报价没过门槛=6，不能都报成数据源故障")
+def t_cloud_pool_vs_no_quotes():
+    """「接口全挂」和「早盘成交额没到门槛」原来都是 no_pool → 退出码 3 →
+    workflow 每天开盘准时打一条「数据源可能故障」。狼来了喊久了，真故障那天
+    就和日常噪音长得一样。这里在沙箱里用假报价把两条路分别走一遍。"""
+    import cloud_run
+    day = datetime.now().strftime("%Y-%m-%d")
+    old_q, old_win = market.fetch_quotes, cloud_run.in_window
+    code_map = {}
+    try:
+        with sandbox():
+            market.fetch_quotes = lambda codes, **k: {}
+            runner.run(verbose=False, execute=False)
+            code_map["skip_no_quotes"] = runner.LAST_SKIP
+
+            low = {c: dict(mk_quote(c, 3.0), amount=1e6) for c in strategy.CORE_POOL}
+            market.fetch_quotes = lambda codes, **k: low
+            runner.run(verbose=False, execute=False)
+            code_map["skip_pool_filtered"] = runner.LAST_SKIP
+
+        cloud_run.in_window = lambda now=None: (True, "10:00")
+        old_run = runner.run
+        try:
+            runner.run = lambda **k: None
+            runner.LAST_SKIP = "no_quotes"
+            code_map["code_no_quotes"] = cloud_run.main([])
+            runner.LAST_SKIP = "pool_filtered"
+            code_map["code_pool_filtered"] = cloud_run.main([])
+        finally:
+            runner.run = old_run
+    finally:
+        market.fetch_quotes, cloud_run.in_window = old_q, old_win
+
+    check(code_map["skip_no_quotes"] == "no_quotes",
+          "一只报价都没有时应报 no_quotes，实际 %s" % code_map["skip_no_quotes"])
+    check(code_map["skip_pool_filtered"] == "pool_filtered",
+          "有报价但没过门槛应报 pool_filtered，实际 %s" % code_map["skip_pool_filtered"])
+    check(code_map["code_no_quotes"] == 3,
+          "没报价是数据源故障，应返回 3，实际 %s" % code_map["code_no_quotes"])
+    check(code_map["code_pool_filtered"] == 6,
+          "没过门槛属正常跳过，应返回 6，实际 %s" % code_map["code_pool_filtered"])
 
 
 # ==========================================================================

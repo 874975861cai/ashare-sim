@@ -25,7 +25,10 @@ STATE = broker.STATE
 OPEN_FILE = os.path.join(STATE, "account_open.json")
 
 # 上一次 run() 为什么没执行（空串 = 正常跑完）。
-# not_trading_day / no_data / no_pool —— 三种「返回 None」的原因不能混为一谈。
+# not_trading_day / no_data / stale_data / no_quotes / pool_filtered /
+# strategy_changed —— 都是「返回 None」，但原因必须分开传出去：
+# 前两个是日历原因，中间两个是数据源故障，pool_filtered 是「有行情但没标的
+# 过门槛」（早盘成交额天然偏低），混成一个退出码，调用方就只能二选一地错报。
 LAST_SKIP = ""
 
 # 上一次账本推送的结果 (status, msg)。账本写成功、但看板没更新，是第三种
@@ -39,14 +42,20 @@ class StrategyChanged(RuntimeError):
 
 
 def params_sig(params=None):
-    """策略参数指纹。只取影响成交决策的键，排序后哈希。"""
+    """策略参数指纹：**全量**哈希，不维护白名单。
+
+    2026-11-07 修：原来手写 16 个键的白名单，漏了三个真的影响成交的参数——
+    `hold_cooldown_days`（熔断后冷却天数，runner 自己读）、`min_amount` /
+    `min_price`（validate_pool 用它筛池）。白名单失效的方向恰好是最坏的那个：
+      · 多算一个不影响的键 → 当天被护栏拦一次，退出码 5，日志里看得见，代价一天；
+      · 漏算一个影响的键   → 用新参数重放整天，前视偏差，账本被悄悄改写。
+    后者正是 2026-10-28 那次事故（成交从 10 笔退回 9 笔）。所以改成全量：
+    新增参数不需要记得来改这里，代价最多是当天被拦一次。
+    顺带把口径和 doctor._params_sig（本来就是全量）对齐，同一个概念不再有两个定义。
+    """
     import hashlib
     p = params if params is not None else strategy.PARAMS
-    keys = ("mode", "hold_target", "hold_entry_time", "hold_stop",
-            "entry_enabled", "dev_enter", "mom_turn", "rebound",
-            "take_profit", "stop_loss", "max_hold_min", "force_exit",
-            "earliest_entry", "latest_entry", "max_trades", "market_filter")
-    raw = json.dumps({k: p.get(k) for k in keys}, sort_keys=True,
+    raw = json.dumps({k: p[k] for k in sorted(p)}, sort_keys=True,
                      ensure_ascii=False, default=str)
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
 
@@ -218,8 +227,27 @@ def run(verbose=True, params=None, execute=True, ttl=600):
         # 但对调用方都表现为 run() 返回 None。于是 cloud_run 把它们都当成
         # 退出码 2（正常跳过），workflow 也就放着不管——接口全挂的那种日子
         # 看起来和周末一模一样。用 LAST_SKIP 把原因带出去，别再让调用方猜。
-        LAST_SKIP = "no_pool"
-        print("今日无可交易标的（流动性/价格不达标）")
+        #
+        # 2026-11-07 补：no_pool 本身又合了两种相反的情况，仍旧会错报——
+        #   · 报价根本没拿到（接口挂了）      → 真故障，必须亮
+        #   · 拿到报价、但没过成交额/价格门槛  → 正常（早盘累计成交额天然偏低，
+        #     09:30 那几轮几乎必然全被筛掉），报成「数据源可能故障」等于每天早上
+        #     准时喊一次狼来了，真出事那天就淹在同款告警里（和 E10/E17 同一个病）。
+        # 所以拆成 no_quotes（故障）与 pool_filtered（正常跳过），并把实际数字打出来：
+        # 若成交额被接口清零，日志里会是「0.00 亿 < 2.0 亿」——一眼看得出不是行情问题。
+        got = [c for c in strategy.CORE_POOL if c in quotes]
+        if not got:
+            LAST_SKIP = "no_quotes"
+            print("今天的报价一只都没拿到（池子 %d 只），按数据源故障处理"
+                  % len(strategy.CORE_POOL))
+            return None
+        detail = "、".join(
+            "%s 成交额%.2f亿/价%.3f" % (c, (quotes[c].get("amount") or 0) / 1e8,
+                                       quotes[c].get("price") or 0)
+            for c in got)
+        LAST_SKIP = "pool_filtered"
+        print("有报价但全部未达门槛（%d/%d 只）：%s"
+              % (len(got), len(strategy.CORE_POOL), detail))
         return None
 
     # 拉分时

@@ -98,8 +98,14 @@ def summarize(trades, equity, days=5):
 
 
 def deviations(trades, equity, acc):
-    """规则偏离检查：比盈亏更能说明问题。"""
+    """规则偏离检查：比盈亏更能说明问题。
+
+    返回 (issues, notes)：
+      issues —— 真正需要处理的违规（计入「另有 N 项规则偏离」）
+      notes  —— 需要解释但不构成违规的情况（如持有型的市值波动）
+    """
     issues = []
+    notes = []
 
     # 1) 过夜持仓
     #    2026-10-23 修：股票型 ETF 是 T+1，当天买入的份额当天根本卖不掉，
@@ -125,14 +131,55 @@ def deviations(trades, equity, acc):
             issues.append("**单日超频**：%s 买入 %d 次，上限 %d" % (d, n, cap))
 
     # 3) 单日大亏
+    #    2026-11-06 修：-1% 这条线是给日内策略定的。持有型一次建仓拿数月，
+    #    标的单日跌 2% 是行情，不是「违规」——把它列进「规则偏离需处理」，
+    #    等于每周都在报一件本来就该发生的事，真偏离会被这类噪音淹掉。
+    #    持有型真正的控制线是 hold_stop（距成本），所以这里改口径：
+    #      · 建仓之后的浮亏 → 只作说明（附距 hold_stop 还有多远）
+    #      · 建仓之前的亏损 → 标为历史（属已停用的日内策略）
+    mode = str(strategy.PARAMS.get("mode") or "intraday")
+    hold_start = None
+    avg_cost = 0.0
+    shares = 0
+    if mode == "hold":
+        lot_dates, cost_amt = [], 0.0
+        for pos in acc.get("positions", {}).values():
+            for lot in pos.get("lots", []):
+                if lot.get("date"):
+                    lot_dates.append(lot["date"])
+                sh = fnum(lot.get("shares"))
+                shares += sh
+                cost_amt += sh * fnum(lot.get("price"))
+        hold_start = min(lot_dates) if lot_dates else None
+        avg_cost = (cost_amt / shares) if shares else 0.0
+
     for e in equity:
         dp = fnum(e.get("day_pnl"))
         eq = fnum(e.get("equity"), 10000)
-        if eq and dp / eq < DAY_LOSS_LIMIT:
-            issues.append("**单日大亏**：%s 亏 ¥%.2f（%.2f%%）"
-                          % (e.get("date"), dp, dp / eq * 100))
+        if not (eq and dp / eq < DAY_LOSS_LIMIT):
+            continue
+        d = str(e.get("date") or "")
+        pct = dp / eq * 100
+        if mode != "hold":
+            issues.append("**单日大亏**：%s 亏 ¥%.2f（%.2f%%）" % (d, dp, pct))
+            continue
+        if hold_start and d >= hold_start:
+            gap = None
+            if avg_cost > 0 and shares > 0:
+                mv = eq - fnum(acc.get("cash"))
+                gap = (mv / shares / avg_cost - 1) * 100
+            tail = ("距 hold_stop %.0f%% 还有 %.2f 个百分点"
+                    % (fnum(strategy.PARAMS.get("hold_stop")) * 100,
+                       gap - fnum(strategy.PARAMS.get("hold_stop")) * 100)
+                    if gap is not None else "控制线为 hold_stop")
+            notes.append("（浮亏说明）%s 单日 ¥%.2f（%.2f%%），为持有型仓位的市值波动，"
+                         "非执行偏离；%s。" % (d, dp, pct, tail))
+        else:
+            notes.append("（历史）%s 单日 ¥%.2f（%.2f%%），发生在持有型建仓（%s）之前，"
+                         "归属已停用的日内策略，不属本期偏离。"
+                         % (d, dp, pct, hold_start or "未建仓"))
 
-    return issues
+    return issues, notes
 
 
 def gate(n_trades, n_days):
@@ -318,7 +365,8 @@ def try_backtest(ndays=5):
 
 
 # --------------------------------------------------------------------------
-def render_markdown(summary, gate_info, issues, bt, acc, audit=None):
+def render_markdown(summary, gate_info, issues, bt, acc, audit=None, notes=None):
+    notes = notes or []
     now = datetime.now()
     recent = summary["recent"]
     total = summary["total"]
@@ -363,6 +411,8 @@ def render_markdown(summary, gate_info, issues, bt, acc, audit=None):
                       gate_info["need_trades"], gate_info["need_days"]))
     if issues:
         verdict += " 另有 %d 项规则偏离需处理。" % len(issues)
+    elif notes:
+        verdict += " 无规则偏离（另有 %d 条浮亏/历史说明，见下）。" % len(notes)
     else:
         verdict += " 无规则偏离。"
     L.append("")
@@ -409,6 +459,8 @@ def render_markdown(summary, gate_info, issues, bt, acc, audit=None):
         L.append("- （说明）持有 T+1 品种 %s，过夜是规则强制、非执行偏离；"
                  "但这意味着**当日买入的仓位当日无法止损**，风险敞口实际是隔夜跳空。"
                  % "、".join(forced_overnight))
+    for s in notes:
+        L.append("- " + s)
     L.append("")
 
     # ---- 回测对照 ----
@@ -513,7 +565,7 @@ def main():
 
     acc, trades, equity = load_all()
     summary = summarize(trades, equity, days=args.days)
-    issues = deviations(trades, equity, acc)
+    issues, notes = deviations(trades, equity, acc)
     gate_info = gate(summary["total"]["n"], summary["n_days"])
     # 即使样本未达标也跑回测：数据是否够用应由 try_backtest 自己判断，
     # 否则「样本不足」会被误报成「缓存不足」，掩盖真实状态。
@@ -521,7 +573,7 @@ def main():
     bt = try_backtest(ndays=max(args.days, 5))
 
     audit = pool_audit(ndays=max(args.days, 5))
-    md = render_markdown(summary, gate_info, issues, bt, acc, audit)
+    md = render_markdown(summary, gate_info, issues, bt, acc, audit, notes)
     os.makedirs(JOURNAL, exist_ok=True)
     path = os.path.join(JOURNAL, "weekly-%s.md" % datetime.now().strftime("%Y-%m-%d"))
     with open(path, "w", encoding="utf-8") as f:
