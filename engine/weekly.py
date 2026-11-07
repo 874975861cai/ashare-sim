@@ -148,10 +148,13 @@ def deviations(trades, equity, acc):
     #      · 建仓之后的浮亏 → 只作说明（附距 hold_stop 还有多远）
     #      · 建仓之前的亏损 → 标为历史（属已停用的日内策略）
     mode = str(strategy.PARAMS.get("mode") or "intraday")
+    # mix 也是持有型（建仓后拿数月、要过夜），单日 -2% 同样是行情而不是违规。
+    # 不并进来，组合上线第一周就会天天报「单日大亏」。
+    long_hold = mode in ("hold", "mix")
     hold_start = None
     avg_cost = 0.0
     shares = 0
-    if mode == "hold":
+    if long_hold:
         lot_dates, cost_amt = [], 0.0
         for pos in acc.get("positions", {}).values():
             for lot in pos.get("lots", []):
@@ -170,7 +173,7 @@ def deviations(trades, equity, acc):
             continue
         d = str(e.get("date") or "")
         pct = dp / eq * 100
-        if mode != "hold":
+        if not long_hold:
             issues.append("**单日大亏**：%s 亏 ¥%.2f（%.2f%%）" % (d, dp, pct))
             continue
         if hold_start and d >= hold_start:
@@ -178,10 +181,16 @@ def deviations(trades, equity, acc):
             if avg_cost > 0 and shares > 0:
                 mv = eq - fnum(acc.get("cash"))
                 gap = (mv / shares / avg_cost - 1) * 100
-            tail = ("距 hold_stop %.0f%% 还有 %.2f 个百分点"
-                    % (fnum(strategy.PARAMS.get("hold_stop")) * 100,
-                       gap - fnum(strategy.PARAMS.get("hold_stop")) * 100)
-                    if gap is not None else "控制线为 hold_stop")
+            # 控制线跟着模式走：hold 靠 hold_stop（熔断），mix 没有止损，
+            # 只有年度再平衡 + 偏离带。把 hold_stop 套到组合上是错的口径。
+            if mode == "mix":
+                tail = "组合无止损，控制线是偏离带 %.0f%% 与年度再平衡" % (
+                    fnum(strategy.PARAMS.get("mix_band"), 0.12) * 100)
+            else:
+                tail = ("距 hold_stop %.0f%% 还有 %.2f 个百分点"
+                        % (fnum(strategy.PARAMS.get("hold_stop")) * 100,
+                           gap - fnum(strategy.PARAMS.get("hold_stop")) * 100)
+                        if gap is not None else "控制线为 hold_stop")
             notes.append("（浮亏说明）%s 单日 ¥%.2f（%.2f%%），为持有型仓位的市值波动，"
                          "非执行偏离；%s。" % (d, dp, pct, tail))
         else:
@@ -377,6 +386,23 @@ def try_backtest(ndays=5):
     #   把恒等表当评审依据，比不跑回测更危险——它给了一个虚假的「已检验」。
     #   持有型的参数只有 hold_target / hold_stop / hold_entry_time，
     #   而它们的效果必须用多年日线看（engine/riskstudy.py），不是 5~12 天分钟线。
+    if str(base.get("mode") or "daytrade") == "mix":
+        w = base.get("mix_weights") or {}
+        return {
+            "days": days, "rows": [], "note":
+            "当前策略为跨市场配比（mode=mix）：%s。\n>\n"
+            "> 组合模式**没有可日常调的参数**：调仓只由「距上次 %d 交易日」和"
+            "「权重偏离超过 %.0f%%」触发，两者是约束，不是拟合出来的旋钮。"
+            "年化/回撤的证据在 `python engine/hiret.py`（11 年日线、18 只标的、"
+            "样本内外分段），不在 %d 天分钟线上。\n>\n"
+            "> 所以本表故意为空。硬凑一张恒等表，等于给一个虚假的「已检验」"
+            "——2026-10-30 那期 6 行全等就是这么来的。每周真正该看的是"
+            "「实际权重是否还在带内」，见上面的持仓。"
+            % ("、".join("%s %.0f%%" % (c, v * 100) for c, v in w.items()),
+               int(base.get("mix_rebal_days") or 244),
+               float(base.get("mix_band") or 0.12) * 100, len(days)),
+        }
+
     if str(base.get("mode") or "daytrade") == "hold":
         return {
             "days": days, "rows": [], "note":
@@ -635,7 +661,7 @@ def main():
     acc, trades, equity = load_all()
     summary = summarize(trades, equity, days=args.days)
     issues, notes = deviations(trades, equity, acc)
-    hold_mode = str(strategy.PARAMS.get("mode") or "") == "hold"
+    hold_mode = str(strategy.PARAMS.get("mode") or "") in ("hold", "mix")
     last_review, days_since = review_age(equity)
     gate_info = gate(summary["total"]["n"], summary["n_days"],
                      hold_mode=hold_mode, days_since=days_since,

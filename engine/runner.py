@@ -215,13 +215,28 @@ def run(verbose=True, params=None, execute=True, ttl=600):
     LAST_SKIP = ""
     LAST_PUSH = ("", "")
     params = params or dict(strategy.PARAMS)
+    mix_mode = params.get("mode") == "mix"
     acc = broker.load_account()
     now = datetime.now()
     day = now.strftime("%Y-%m-%d")
-    _warn_overnight(acc, day, verbose, hold_mode=params.get("mode") == "hold")
+    _warn_overnight(acc, day, verbose,
+                    hold_mode=params.get("mode") in ("hold", "mix"))
 
     quotes = market.fetch_quotes(strategy.CORE_POOL)
     pool = strategy.validate_pool(quotes, params)
+
+    # 组合模式的标的必须进 pool，否则拿不到它的分时，交易日守卫和
+    # 「今天到底有没有开盘」都会失效。validate_pool 的 min_amount /
+    # range_pct 打分是给日内选股用的，这里不该由它决定组合能不能建仓——
+    # 权重已经写死了，缺一只就是缺 30% 的仓位。
+    if mix_mode:
+        have = {p["code"] for p in pool}
+        for c in (params.get("mix_weights") or {}):
+            q = quotes.get(c)
+            if not q or not q.get("price") or c in have:
+                continue
+            pool.append({**q, "range_pct": 0.0, "tick_friction": 0.0})
+            have.add(c)
     if not pool:
         # 「今天没有可交易标的」和「非交易日」是两件完全不同的事，
         # 但对调用方都表现为 run() 返回 None。于是 cloud_run 把它们都当成
@@ -338,10 +353,19 @@ def run(verbose=True, params=None, execute=True, ttl=600):
         asof_pct[tt] = last_pct
     pos = None
     events = []
+    mix_done = False
 
     # 开盘就有持仓（过夜仓）= 上一次收盘没平掉。必须接回来继续管理，
     # 否则这里认为是空仓，会去开第二只——而资金天然不够同时摊薄两只。
-    if acc.get("positions"):
+    if acc.get("positions") and mix_mode:
+        # 组合模式不设 pos：一旦设了，下面的单标的日内管理就会来接管，
+        # 用某一只的止盈止损去砍整个组合。这里只把持仓念一遍。
+        if verbose:
+            print("  [续管] 组合持仓 %d 只：%s" % (
+                len(acc["positions"]),
+                "、".join("%s %d份" % (c, broker.position_shares(p))
+                         for c, p in acc["positions"].items())))
+    elif acc.get("positions"):
         c0 = next(iter(acc["positions"]))
         if c0 in data:
             pos = {"code": c0,
@@ -367,6 +391,103 @@ def run(verbose=True, params=None, execute=True, ttl=600):
     for i, t in enumerate(tlist):
         tm = t[11:16]
         dt = datetime.strptime(t, "%Y-%m-%d %H:%M")
+
+        # --- 组合模式（mode="mix"）-------------------------------------
+        # 每天只在 mix_time 之后算一次配比，之后什么都不做。
+        # 这里刻意不进入下面的持仓管理分支：组合层没有止盈止损、没有
+        # 尾盘强平——hiret.py 第三/四层已证明日频择时在样本外全部衰减，
+        # 唯一有效的动作是「年度拉回权重」。
+        #
+        # 成交价必须取 mix_time 那一根分钟线，不能取 quotes 的最新价：
+        # 下午 14:00 跑批时用 14:00 的价执行 09:35 的决定，就是前视偏差，
+        # 和 2026-10-28 那次「改完策略重放建仓」是同一类错误。
+        if mix_mode:
+            if mix_done or tm < str(params.get("mix_time", "09:35")):
+                continue
+            mix_done = True
+            if not strategy.mix_rebal_due(acc.get("mix_last_rebal"), day, params):
+                if verbose:
+                    print("  [组合] 距上次调仓未满 %d 交易日，今日不动（上次 %s）"
+                          % (int(params.get("mix_rebal_days", 244)),
+                             acc.get("mix_last_rebal")))
+                continue
+            tgt_t = next((x for x in tlist if x[11:16] >= tm), None)
+            if not tgt_t:
+                continue
+            holdings = {c: broker.position_shares(p)
+                        for c, p in (acc.get("positions") or {}).items()}
+            prices = {}
+            for c in set(list(params.get("mix_weights") or {}) + list(holdings)):
+                k = idx.get(c, {}).get(tgt_t)
+                if k is None:
+                    continue          # 这一分钟没有 tick：今天不碰这只
+                prices[c] = data[c]["ticks"][k]["price"]
+            eq = float(acc["cash"])
+            for c, sh in holdings.items():
+                p0 = prices.get(c)
+                if p0:
+                    eq += sh * p0
+                else:
+                    eq += sh * broker.avg_cost(acc["positions"][c])
+            orders, diag = strategy.plan_mix(eq, holdings, prices, params)
+            if verbose:
+                print("  [组合] %s 权益 ¥%.2f，%d 条指令" % (tgt_t[11:], eq, len(orders)))
+                for d in diag:
+                    print("         · %s" % d)
+            dt2 = datetime.strptime(tgt_t, "%Y-%m-%d %H:%M")
+            for o in orders:
+                c = o["code"]
+                p0 = prices.get(c)
+                if not p0:
+                    continue
+                nm = (data.get(c) or {}).get("name") or c
+                pre = (data.get(c) or {}).get("preclose")
+                if o["side"] == "SELL":
+                    posd = (acc.get("positions") or {}).get(c)
+                    if not posd:
+                        continue
+                    # T+1：今天刚买的份额今天卖不掉。组合调仓只会在
+                    # 「刚建仓又立刻要卖」这种自相矛盾的情况下撞上它。
+                    avail = broker.available_shares(posd, day, c)
+                    sh = min(int(o["shares"]), avail) // 100 * 100
+                    if sh < 100:
+                        events.append({"t": tgt_t, "act": "LOCKED", "code": c,
+                                       "reason": "可卖 %d 股不足一手" % avail})
+                        continue
+                    try:
+                        r = broker.sell(acc, c, nm, p0, sh, dt2,
+                                        reason=o["reason"], preclose=pre)
+                        events.append({"t": tgt_t, "act": "SELL", "code": c,
+                                       "name": nm, "price": r["price"],
+                                       "shares": r["shares"], "pnl": r["pnl"],
+                                       "fee": r["fee"], "reason": o["reason"]})
+                        ctx["trades"] += 1
+                    except broker.Reject as e:
+                        events.append({"t": tgt_t, "act": "REJECT", "code": c,
+                                       "reason": str(e)})
+                else:
+                    budget = acc["cash"] - 5.0
+                    sh = min(int(o["shares"]),
+                             int(budget / (p0 * 1.001) / 100) * 100)
+                    if sh < 100:
+                        events.append({"t": tgt_t, "act": "REJECT", "code": c,
+                                       "reason": "现金不足一手"})
+                        continue
+                    try:
+                        r = broker.buy(acc, c, nm, p0, sh, dt2,
+                                       reason=o["reason"], preclose=pre)
+                        events.append({"t": tgt_t, "act": "BUY", "code": c,
+                                       "name": nm, "price": r["price"],
+                                       "shares": r["shares"], "fee": r["fee"],
+                                       "reason": o["reason"]})
+                        ctx["trades"] += 1
+                    except broker.Reject as e:
+                        events.append({"t": tgt_t, "act": "REJECT", "code": c,
+                                       "reason": str(e)})
+            if orders:
+                acc["mix_last_rebal"] = day
+            continue
+
         # 大盘涨跌不再在这里更新：它必须与「决策那一根」对齐（见上面的 asof_pct）。
         # 原来的写法用第 i 分钟的指数价，而 decide 读 ticks[k-1]，等于让 R6
         # 提前一分钟看到还没发生的下跌——回测里同一个错 2026-11-05 已实测复现。
@@ -398,7 +519,8 @@ def run(verbose=True, params=None, execute=True, ttl=600):
                 # 所以强平要按时间轴再压一次。
                 # 例外：mode="hold" 是要过夜的，这里绝不能平——否则持有型策略
                 # 会退化成「每天买、每天尾盘卖」，那正是被证伪的日内策略。
-                if (params.get("mode") != "hold" and tm >= params["force_exit"]
+                if (params.get("mode") not in ("hold", "mix")
+                        and tm >= params["force_exit"]
                         and act != "SELL" and can_sell):
                     act, reason = "SELL", "尾盘强平"
                 if act == "SELL" and execute:
@@ -503,9 +625,11 @@ def run(verbose=True, params=None, execute=True, ttl=600):
     # --- 收盘兜底强平 ---
     # 走到这里还有仓位，说明该标的尾盘没有 tick，循环里的强平根本没机会执行。
     # 不补这一步，仓位就会安静地过夜。
-    # mode="hold" 本来就要过夜，兜底强平必须关掉——这是第二处，别只改一处。
+    # mode="hold"/"mix" 本来就要过夜，兜底强平必须关掉——这是第二处，别只改一处。
+    # mix 漏在这里的后果最严重：它会把刚建好的组合在 14:50 一次性清空，
+    # 而且只清 iteration 顺序里的第一只，账面上看不出是 bug。
     if execute and pos and acc.get("positions") and tlist \
-            and params.get("mode") != "hold":
+            and params.get("mode") not in ("hold", "mix"):
         can_sell = bool(pos.get("overnight")) or broker.is_t0_etf(pos["code"])
         if tlist[-1][11:16] >= params["force_exit"] and not can_sell:
             # T+1 当天买入的份额，尾盘也确实卖不掉。这是规则，不是故障——

@@ -46,7 +46,7 @@ VERBOSE = False
 CASES = []
 # 用例总数基线（见 main() 里的说明：少了要红，不是"通过 41 项"）。
 # 2026-10-19 建 1 条起算，每加一条用例都要同步改这里。
-EXPECTED_CASES = 45
+EXPECTED_CASES = 49
 
 
 def case(name):
@@ -540,7 +540,11 @@ def t_overnight():
             {"510300": {"ticks": ticks, "preclose": 4.0, "name": "沪深300ETF"},
              "510500": {"ticks": ticks2, "preclose": 7.0, "name": "中证500ETF"}}, q)
         try:
-            runner.run(verbose=False, execute=True)
+            # 显式钉住 hold：2026-11-07 默认 mode 改成 mix 之后，不钉住的话
+            # 这里跑的是组合调仓，会把 510300 当「移出组合」卖掉，断言就
+            # 变成在拒绝正确行为。这条用例测的始终是 hold 的行为。
+            runner.run(verbose=False, execute=True,
+                       params=dict(strategy.PARAMS, mode="hold"))
             a = broker.load_account()
             rows = doctor._read_trades()
         finally:
@@ -552,6 +556,128 @@ def t_overnight():
         check(not any(r["side"] == "SELL" for r in rows),
               "持有型策略不该产生任何卖出：%s"
               % [r["reason"] for r in rows if r["side"] == "SELL"])
+
+
+@case("组合模式：按 40/30/30 建仓，且不做尾盘强平")
+def t_mix_build():
+    """mode="mix" 的核心行为：一次建三只、权重到位、之后整天不动。
+
+    这里最要紧的是「不做尾盘强平」。runner 有两处强平（循环内 + 收盘兜底），
+    2026-11-07 切模式时两处都改成了 `mode not in ("hold","mix")`。若漏一处，
+    组合会在 14:50 被清空——而日志上会写成「尾盘强平」，看起来像正常动作。
+    """
+    with sandbox():
+        acc = broker.load_account()
+        acc["cash"] = 100000.0
+        acc["meta"]["init_capital"] = 100000.0
+        acc["meta"]["max_positions"] = 3
+        broker.save_account(acc)
+        day = today()
+        n = len(session_minutes())
+        raw = {"513100": 1.80, "518880": 3.60, "159915": 2.40}
+        trends, quotes = {}, {}
+        for c, p in raw.items():
+            trends[c] = {"ticks": mk_ticks(day, flat_prices(n, p), preclose=p),
+                         "preclose": p, "name": c}
+            quotes[c] = mk_quote(c, p, preclose=p)
+        old = install_fake_market(trends, quotes)
+        try:
+            r = runner.run(verbose=False, execute=True)
+            a = broker.load_account()
+            rows = doctor._read_trades()
+        finally:
+            restore_market(old)
+        check(r is not None, "组合模式没跑到收盘（行情被误判成非交易日）")
+        check(len(a["positions"]) == 3,
+              "组合应持有 3 只，实际 %s" % list(a["positions"]))
+        mv = {c: broker.position_shares(p) * raw[c]
+              for c, p in a["positions"].items()}
+        eq = a["cash"] + sum(mv.values())
+        for c, w in strategy.PARAMS["mix_weights"].items():
+            check(abs(mv[c] / eq - w) < 0.05,
+                  "%s 权重 %.1f%% 偏离目标 %.0f%%" % (c, mv[c] / eq * 100, w * 100))
+        check(a["cash"] >= 0, "现金为负：%.2f" % a["cash"])
+        check(not any(r0["side"] == "SELL" for r0 in rows),
+              "刚建仓不该有卖出：%s" % [r0["reason"] for r0 in rows])
+
+
+@case("组合模式：旧策略持仓必须被移出，不能和新组合并存")
+def t_mix_evict():
+    """从 510880 换到组合时，红利仓要由 plan_mix 清掉。
+
+    不能靠手工改账本清仓——那等于用收盘价虚构一笔成交。这里验证
+    「移出组合」这条路径真的会把钱腾出来并投进目标标的。
+    """
+    with sandbox():
+        acc = broker.load_account()
+        acc["cash"] = 90224.10
+        acc["meta"]["init_capital"] = 100169.60
+        acc["meta"]["max_positions"] = 3
+        seed_position(acc, "510880", 2900, 3.40, days_before(9))
+        broker.save_account(acc)
+        day = today()
+        n = len(session_minutes())
+        raw = {"513100": 1.80, "518880": 3.60, "159915": 2.40, "510880": 3.37}
+        trends, quotes = {}, {}
+        for c, p in raw.items():
+            trends[c] = {"ticks": mk_ticks(day, flat_prices(n, p), preclose=p),
+                         "preclose": p, "name": c}
+            quotes[c] = mk_quote(c, p, preclose=p)
+        old = install_fake_market(trends, quotes)
+        try:
+            runner.run(verbose=False, execute=True)
+            a = broker.load_account()
+        finally:
+            restore_market(old)
+        check("510880" not in a["positions"],
+              "旧持仓没被移出：%s" % list(a["positions"]))
+        check(len(a["positions"]) == 3,
+              "移出后应建满 3 只，实际 %s" % list(a["positions"]))
+        check(any(c in a["positions"] for c in ("513100", "518880", "159915")),
+              "移出旧仓后没有买入新标的")
+
+
+@case("入金：追加资金不能算成当日盈利")
+def t_flow():
+    """2026-11-09 追加 9 万把本金从 1 万加到 10 万。
+
+    如果 snapshot 不扣 flow，当天「当日盈亏」会显示 +90,169.60，然后
+    周报的「最佳交易日」永久被这条假记录占据，日胜率/日波动/夏普全部失真。
+    """
+    with sandbox():
+        acc = broker.load_account()
+        acc["cash"] = 10000.0
+        acc["meta"]["init_capital"] = 10000.0
+        acc["today"] = "2026-01-05"
+        broker.snapshot(acc, {}, note="起点", write=True)
+
+        acc["cash"] = 100000.0
+        acc["meta"]["init_capital"] = 100000.0
+        acc["flows"] = {"2026-01-06": 90000.0}
+        acc["today"] = "2026-01-06"
+        sn = broker.snapshot(acc, {}, note="入金", write=True)
+        check(abs(sn["day_pnl"]) < 1.0,
+              "入金被算成当日盈利：%.2f（应≈0）" % sn["day_pnl"])
+        check(abs(sn["total_pnl"]) < 1.0,
+              "累计盈亏把入金算进成本：%.2f" % sn["total_pnl"])
+
+
+@case("组合：权重在偏离带内不动，脱靶才拉回")
+def t_mix_band():
+    """再平衡频率决定成本。带内频繁微调会把收益磨成手续费。"""
+    eq = 100000.0
+    px = {"513100": 1.80, "518880": 3.60, "159915": 2.40}
+    # 39.96% / 29.88% / 30.00%，全部贴着目标，不该有任何指令
+    near = {"513100": 22200, "518880": 8300, "159915": 12500}
+    o1, _d1 = strategy.plan_mix(eq, near, px)
+    check(not o1, "权重在带内却下了单：%s" % o1)
+    # 90% 压在纳指上，必须减回来
+    far = {"513100": 50000, "518880": 1000, "159915": 1000}
+    o2, _d2 = strategy.plan_mix(eq, far, px)
+    check(any(o["code"] == "513100" and o["side"] == "SELL" for o in o2),
+          "纳指脱靶却没减仓：%s" % o2)
+    check(all(o["shares"] % 100 == 0 for o in o2),
+          "下单必须是整手：%s" % o2)
 
 
 @case("日内模式仍可切换：daytrade 下兜底强平必须生效")
@@ -957,7 +1083,11 @@ def t_cloud_pool_vs_no_quotes():
 
             low = {c: dict(mk_quote(c, 3.0), amount=1e6) for c in strategy.CORE_POOL}
             market.fetch_quotes = lambda codes, **k: low
-            runner.run(verbose=False, execute=False)
+            # 钉住 daytrade：pool_filtered 是「日内选池全被门槛筛掉」的概念。
+            # mix 模式会把组合标的强行加进 pool（组合缺一只就缺 30% 仓位），
+            # 池子永远不会空，这条路径根本不会发生——不是 bug，是不同策略。
+            runner.run(verbose=False, execute=False,
+                       params=dict(strategy.PARAMS, mode="daytrade"))
             code_map["skip_pool_filtered"] = runner.LAST_SKIP
 
         cloud_run.in_window = lambda now=None: (True, "10:00")

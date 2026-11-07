@@ -1,6 +1,6 @@
 {
   "meta": {
-    "init_capital": 10000.0,
+    "init_capital": 100169.6,
     "created": "2026-10-19 10:49:14",
     "broker": "模拟盘（A股规则引擎）",
     "fee": {
@@ -8,9 +8,11 @@
       "commission_min": 5.0,
       "stamp_tax": 0.0005,
       "transfer_fee": 1e-05
-    }
+    },
+    "max_positions": 3,
+    "capital_note": "2026-11-07 迁移：本金 1 万 -> 10 万，结构 单标的红利 -> 纳/金/创 40/30/30"
   },
-  "cash": 54.5,
+  "cash": 90224.1,
   "positions": {
     "510880": {
       "name": "红利ETF华泰柏瑞",
@@ -28,5 +30,8 @@
   },
   "trade_seq": 11,
   "today": "2026-11-06",
-  "peak_equity": 10000.0
+  "peak_equity": 10000.0,
+  "flows": {
+    "2026-11-09": 90169.6
+  }
 }

@@ -31,7 +31,20 @@ TRADE_FILE = os.path.join(STATE, "trades.csv")
 EQUITY_FILE = os.path.join(STATE, "equity.csv")
 
 INIT_CAPITAL = 10000.0
-MAX_POSITIONS = 1        # 1 万本金只够摊薄一只标的的摩擦，策略也是这么定的
+MAX_POSITIONS = 1        # 默认值。10 万组合账户由 meta.max_positions=3 覆盖
+
+
+def _max_positions(acc):
+    """持仓只数上限：优先读账本，读不到就用默认 1。
+
+    不做「按 mode 自动推断」——上限是资金属性，不是策略属性。
+    让策略偷偷改风控参数，正是账户被开成 5 只那种事故的起点。
+    """
+    try:
+        v = int(((acc or {}).get("meta") or {}).get("max_positions") or MAX_POSITIONS)
+    except (TypeError, ValueError):
+        return MAX_POSITIONS
+    return max(1, v)
 
 FEE = {
     "commission_rate": 0.00025,
@@ -333,9 +346,14 @@ def buy(acc, code, name, price, shares, dt, reason="", preclose=None):
         raise Reject(f"买入必须为100的整数倍，当前 {shares}")
     # 持仓上限必须在这里挡。runner 用局部变量 pos 记当前仓位，
     # 一旦开盘就有过夜仓，那个 pos 仍是 None，于是它会在已有持仓上再开一只。
-    # 资金天然不够摊薄两只标的，这条只能在券商层强制。
-    if code not in acc["positions"] and len(acc["positions"]) >= MAX_POSITIONS:
-        raise Reject(f"持仓上限 {MAX_POSITIONS} 只，当前已持有 "
+    #
+    # 2026-11-07：上限从「写死 1 只」改成读账本 meta.max_positions。
+    # 1 万本金时代确实只能持一只（佣金 5 元下限，分仓等于罚两次）；
+    # 10 万本金按 40/30/30 建三只，单笔 3.3 万佣金 0.015%，分散是免费的。
+    # 但默认值仍是 1——不改账本就意外变成多仓，比拒单危险得多。
+    cap = _max_positions(acc)
+    if code not in acc["positions"] and len(acc["positions"]) >= cap:
+        raise Reject(f"持仓上限 {cap} 只，当前已持有 "
                      f"{'、'.join(acc['positions'])}")
     if price <= 0:
         raise Reject("报价无效（%s），不能按 0 元成交" % price)
@@ -475,19 +493,35 @@ def snapshot(acc, quotes, note="", write=True):
             rows = list(csv.reader(f))
     today = acc["today"]
     body = [r for r in rows[1:] if r and r[0] != today]
+    # 入金/出金：2026-11-09 追加 90,170 把资金从 1 万加到 10 万。
+    # 不记这一列，「当日盈亏」会把入金算成盈利（当天显示 +90,170），
+    # 周报的「最佳/最差日」「日胜率」全部被一条假记录带偏。
+    flows = acc.get("flows") or {}
+    flow = float(flows.get(today) or 0.0)
     day_start = init
     for r in rows[1:]:
         if r and r[0] < today:
             day_start = float(r[1])
-    day_pnl = round(eq - day_start, 2)
-    body.append([today, f"{eq:.2f}", f"{acc['cash']:.2f}", f"{mv:.2f}",
-                 f"{day_pnl:.2f}", f"{round(eq - init, 2):.2f}", note])
-    body.sort(key=lambda x: x[0])
+    day_pnl = round(eq - day_start - flow, 2)
+    # 历史行只有 7 列，补上 flow=0，否则 csv 列数不齐，DictReader 读出来是 None
+    fixed = []
+    for r in body:
+        r = list(r)
+        if len(r) < 7:
+            r += [""] * (7 - len(r))
+        if len(r) < 8:
+            r.append("0")
+        fixed.append(r[:8])
+    fixed.append([today, f"{eq:.2f}", f"{acc['cash']:.2f}", f"{mv:.2f}",
+                  f"{day_pnl:.2f}", f"{round(eq - init, 2):.2f}", note,
+                  f"{flow:.2f}"])
+    fixed.sort(key=lambda x: x[0])
+    body = fixed
     if write:
         buf = io.StringIO(newline="")
         w = csv.writer(buf)
         w.writerow(["date", "equity", "cash", "market_value",
-                    "day_pnl", "total_pnl", "note"])
+                    "day_pnl", "total_pnl", "note", "flow"])
         w.writerows(body)
         _atomic_write_text(EQUITY_FILE, buf.getvalue(),
                            encoding="utf-8-sig", newline="")

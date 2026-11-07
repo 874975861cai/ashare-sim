@@ -109,18 +109,27 @@ def sync_decision(behind, ahead, conflicts):
 # ==========================================================================
 # 账本重放：纯函数，方便自测
 # ==========================================================================
-def replay(rows, init=10000.0):
+def replay(rows, init=10000.0, flows=None):
     """按流水重算现金/持仓/已实现盈亏，并收集规则违规。
 
     必须用**和 broker 完全相同的算法**：先进先出、按批次核销、
     卖出费用按份额摊到每个批次。用平均成本法重算会和券商对不上，
     然后检查器自己就是错的——这种「看起来对」的检查比没有更危险。
 
+    flows: {日期: 入金金额}。2026-11-09 追加 9 万把本金从 1 万加到 10 万，
+    没有这一参数，`init` 里多出的 9 万会让**历史上每一笔**成交的
+    「现金链」都少 9 万，11 条 CRIT 全是假警报（已实测）。入金必须按
+    日期插入，而不是一次性塞进起点。
+
     返回 (cash, positions, realized, problems)
     positions: {code: [{"shares","price","fee"}]}，未被核销的批次
     problems : [(级别, 描述)]
     """
-    cash = float(init)
+    flows = dict(flows or {})
+    # init 是「累计投入本金」，含全部入金；从流水起点回算时要先扣掉，
+    # 再按各自日期加回去。
+    cash = float(init) - sum(flows.values())
+    pending = sorted(flows.items())
     pos = {}
     realized = 0.0
     probs = []
@@ -168,6 +177,14 @@ def replay(rows, init=10000.0):
                 probs.append((CRIT, "#%d 成交在非竞价时段 %s" % (seq, r["datetime"][11:])))
         except ValueError:
             probs.append((WARN, "#%d 时间无法解析" % seq))
+
+        # ---- 入金/出金按日期入账 ----
+        # 必须插在成交结算之前：同一天先入金再买入是常态，顺序反了
+        # 那一笔的 cash_after 就会差一个入金额。
+        if d:
+            while pending and pending[0][0] <= d:
+                cash += pending[0][1]
+                pending.pop(0)
 
         if side == "BUY":
             if shares <= 0 or shares % 100 != 0:
@@ -219,6 +236,10 @@ def replay(rows, init=10000.0):
                               (seq, float(r["cash_after"]), cash)))
         except (KeyError, ValueError):
             probs.append((WARN, "#%d 缺 cash_after" % seq))
+
+    # 流水之后才发生的入金：还没有成交跟它配对，也要计入现金
+    for _d, amt in pending:
+        cash += amt
 
     pos = {c: l for c, l in pos.items() if l}
     return round(cash, 2), pos, round(realized, 2), probs
@@ -821,7 +842,7 @@ def check_ledger():
     rows = _read_trades()
 
     # ---- 账本重放一致性 ----
-    r_cash, r_pos, r_realized, probs = replay(rows, init)
+    r_cash, r_pos, r_realized, probs = replay(rows, init, acc.get("flows"))
     for lvl, msg in probs:
         add(lvl, "账本", "流水规则", msg)
 
@@ -869,12 +890,17 @@ def check_ledger():
     elif positions:
         add(OK, "账本", "持仓数量", "与流水重放一致")
 
-    # ---- 硬约束：单标的 ----
-    if len(positions) > 1:
+    # ---- 持仓只数上限 ----
+    # 口径跟着账本走：2026-11-07 起 10 万本金按 40/30/30 持三只，
+    # 上限写在 meta.max_positions。写死 1 会让组合账户每天报 CRIT，
+    # 和「过夜仓」那次同一个病：正常状态被报成违规，真出问题时没人看。
+    cap = broker._max_positions(acc)
+    if len(positions) > cap:
         add(CRIT, "账本", "持仓上限",
-            "同时持有 %d 只（策略规定 1 只）：%s" % (len(positions), "、".join(positions)))
+            "同时持有 %d 只（上限 %d 只）：%s"
+            % (len(positions), cap, "、".join(positions)))
     elif positions:
-        add(OK, "账本", "持仓上限", "1 / 1")
+        add(OK, "账本", "持仓上限", "%d / %d" % (len(positions), cap))
 
     # ---- 过夜仓 ----
     # 口径必须跟着策略走：2026-10-28 起 mode="hold"，过夜是设计目标。
