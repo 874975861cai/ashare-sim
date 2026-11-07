@@ -36,7 +36,8 @@ import backtest    # noqa: E402
 import analyze     # noqa: E402
 import broker      # noqa: E402
 import doctor      # noqa: E402
-import market      # noqa: E402
+import market
+import weekly     # noqa: E402      # noqa: E402
 import push_repo   # noqa: E402
 import runner      # noqa: E402
 import strategy    # noqa: E402
@@ -45,7 +46,7 @@ VERBOSE = False
 CASES = []
 # 用例总数基线（见 main() 里的说明：少了要红，不是"通过 41 项"）。
 # 2026-10-19 建 1 条起算，每加一条用例都要同步改这里。
-EXPECTED_CASES = 44
+EXPECTED_CASES = 45
 
 
 def case(name):
@@ -1532,6 +1533,45 @@ def t_push_same_content():
           "内容真的不同却被放行，会把旧版本推上去")
     check(push_repo.same_content(None, None), "两边都没有应算一致")
     check(not push_repo.same_content(None, b"x"), "一边有一边没有不算一致")
+
+
+@case("评审门槛：持有型按交易日算，不按成交笔数算")
+def t_review_gate():
+    """2026-10-19~11-07 两周无人复核的根因回归。
+
+    原门槛是「20 笔 且 10 个交易日」。持有型一年成交 1~2 笔，20 笔要等几十年，
+    于是周报天天报「样本不足、继续观察」——**警报永远不会响，也就永远没人看**。
+    代码从 10-30 就在报告里写「门槛需要人工重新定义」，但没人改，两周就过去了。
+    """
+    # 持有型：0 笔成交，但已 20 个交易日没复核 → 必须判「到期」
+    g = weekly.gate(0, 30, hold_mode=True, days_since=20, last_review="2026-10-09")
+    check(g["ok"], "持有型连续 20 个交易日未复核却仍判「未到期」，门槛又废了")
+    check(g["mode"] == "hold", "持有型没走 hold 分支，还在用笔数门槛")
+    # 刚复核过就不该报到期，否则会逼出无意义的机械复核
+    g2 = weekly.gate(0, 30, hold_mode=True, days_since=3, last_review="2026-11-04")
+    check(not g2["ok"], "刚复核完就判到期，会把复核变成走过场")
+    # 日内模式不能被顺手放宽：2 笔就是样本不足
+    g3 = weekly.gate(2, 60, hold_mode=False)
+    check(not g3["ok"], "日内模式 2 笔就放行，等于废掉样本门槛")
+    check(g3["need_trades"] == weekly.MIN_TRADES - 2, "缺口算错，会让人以为快够了")
+
+    with sandbox() as tmp:
+        old = weekly.REVIEW_FILE
+        weekly.REVIEW_FILE = os.path.join(tmp, "review.json")
+        try:
+            eq = [{"date": "2026-11-%02d" % d} for d in (2, 3, 4, 5, 6)]
+            # 没有登记文件 → 全部交易日都算「未评审」，不能默认已评审
+            last, n = weekly.review_age(eq)
+            check(last == "" and n == len(eq),
+                  "没有评审记录时没把全部天数算成未评审（会假装看过）")
+            with open(weekly.REVIEW_FILE, "w", encoding="utf-8") as f:
+                json.dump({"last_review": "2026-11-04"}, f)
+            last2, n2 = weekly.review_age(eq)
+            check(last2 == "2026-11-04" and n2 == 2,
+                  "评审后剩余交易日算错：last=%r n=%r（应为 11-04 / 2）"
+                  % (last2, n2))
+        finally:
+            weekly.REVIEW_FILE = old
 
 
 if __name__ == "__main__":

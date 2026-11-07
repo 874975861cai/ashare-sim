@@ -20,6 +20,7 @@
 """
 import argparse
 import csv
+import json
 import os
 import sys
 from datetime import datetime
@@ -32,9 +33,18 @@ import strategy   # noqa: E402
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 JOURNAL = os.path.join(BASE, "journal")
 
-MIN_TRADES = 20        # 样本门槛：笔数
+MIN_TRADES = 20        # 样本门槛：笔数（仅日内模式）
 MIN_DAYS = 10          # 样本门槛：交易日
 DAY_LOSS_LIMIT = -0.01  # 单日亏损超 1% 视为异常
+
+# 2026-11-07：持有型的评审门槛不能按笔数算。
+#   一年成交 1~2 笔，「20 笔」在结构上不可达 —— 代码从 10-30 就在报告里
+#   提示「门槛需要人工重新定义，本脚本不擅自放宽」，而没人去改，结果
+#   10-28 到 11-07 连续两周没有任何复核。一条永远不响的警报等于没有警报。
+#   持有型真正的风险不是「样本不足就调参」，是「长期不看」。改按交易日计：
+#   20 个交易日 ≈ 1 个自然月，到点必须人工复核一次。
+HOLD_REVIEW_DAYS = 20
+REVIEW_FILE = os.path.join(BASE, "state", "review.json")
 
 
 # --------------------------------------------------------------------------
@@ -182,10 +192,46 @@ def deviations(trades, equity, acc):
     return issues, notes
 
 
-def gate(n_trades, n_days):
+def review_age(equity):
+    """距上次**人工评审**过了多少个交易日。
+
+    只认 state/review.json 里登记的评审。不拿自动生成的周报当评审记录 ——
+    周报每天都能生成，用它当「已复核」等于自欺，两周不复盘的教训就在这。
+    """
+    dates = [r.get("date") for r in equity if r.get("date")]
+    if not dates:
+        return "", 0
+    last = ""
+    try:
+        with open(REVIEW_FILE, "r", encoding="utf-8") as f:
+            last = (json.load(f) or {}).get("last_review") or ""
+    except Exception:  # noqa: BLE001
+        last = ""
+    after = [d for d in dates if d > last] if last else list(dates)
+    return last, len(after)
+
+
+def gate(n_trades, n_days, hold_mode=False, days_since=None, last_review=""):
+    """评审门槛。两种模式问的问题不同，不能共用一个数。
+
+    日内模式问「样本够不够调参」→ 笔数 + 日数。
+    持有模式问「多久没看过了」→ 交易日数。持有型没有可日常调的参数，
+    它真正的风险是没人看，所以门槛必须按时间算，不能按成交笔数算。
+    """
+    if hold_mode:
+        n = days_since or 0
+        return {
+            "ok": n >= HOLD_REVIEW_DAYS,
+            "mode": "hold",
+            "days_since": n,
+            "last_review": last_review,
+            "need_days": max(0, HOLD_REVIEW_DAYS - n),
+            "n_trades": n_trades, "n_days": n_days, "need_trades": 0,
+        }
     ok = n_trades >= MIN_TRADES and n_days >= MIN_DAYS
     return {
         "ok": ok,
+        "mode": "daytrade",
         "n_trades": n_trades, "n_days": n_days,
         "need_trades": max(0, MIN_TRADES - n_trades),
         "need_days": max(0, MIN_DAYS - n_days),
@@ -399,7 +445,19 @@ def render_markdown(summary, gate_info, issues, bt, acc, audit=None, notes=None)
 
     # ---- 结论先行 ----
     L.append("## 一句话结论")
-    if gate_info["ok"]:
+    hold_mode = gate_info.get("mode") == "hold"
+    if hold_mode:
+        n = gate_info["days_since"]
+        last = gate_info.get("last_review") or "从未登记"
+        if gate_info["ok"]:
+            verdict = ("持有型：距上次人工评审 **%d 个交易日**（门槛 %d），"
+                       "**已到期，必须复核一次**。" % (n, HOLD_REVIEW_DAYS))
+        else:
+            verdict = ("持有型：距上次人工评审 %d 个交易日（门槛 %d），"
+                       "还差 %d 个交易日到期。"
+                       % (n, HOLD_REVIEW_DAYS, gate_info["need_days"]))
+        verdict += " 上次评审登记：%s。" % last
+    elif gate_info["ok"]:
         verdict = ("样本已达标（%d 笔 / %d 日），**可以评审参数**。"
                    % (gate_info["n_trades"], gate_info["n_days"]))
     else:
@@ -417,16 +475,16 @@ def render_markdown(summary, gate_info, issues, bt, acc, audit=None, notes=None)
         verdict += " 无规则偏离。"
     L.append("")
     L.append(verdict)
-    if not gate_info["ok"] and str(strategy.PARAMS.get("mode") or "") == "hold":
-        # 2026-10-30：门槛是按日内策略（约 0.6 笔/日）定的。持有型一年成交
-        # 1~2 笔，「20 笔」等于几十年，这个门槛在 hold 模式下永远达不到，
-        # 也就意味着「永远不评审」——那不是谨慎，是把评审机制废掉了。
-        # 这里不擅自改门槛（改门槛=改评审标准的宽松度，得人来定），只把话说清。
+    if hold_mode:
+        # 2026-11-07：原门槛「20 笔」在持有型下永远达不到，等于把评审机制废掉。
+        # 现在改成按交易日计（HOLD_REVIEW_DAYS），这里说明为什么换口径，
+        # 免得以后有人以为是放宽标准。
         L.append("")
-        L.append("> ⚠️ 门槛（%d 笔）是按日内策略定的；当前是持有型（mode=hold），"
-                 "实际频率约 1 笔/季度，「%d 笔」在结构上不可达。"
-                 "门槛本身需要人工重新定义，本脚本不擅自放宽。"
-                 % (MIN_TRADES, MIN_TRADES))
+        L.append("> 门槛口径说明：持有型一年成交 1~2 笔，按「%d 笔」算等于永不评审，"
+                 "而 10-28~11-07 确实连续两周无人复核。持有型没有可日常调的参数，"
+                 "真正的风险是「长期不看」，故门槛改为 **%d 个交易日 ≈ 1 个自然月**，"
+                 "到点必须人工复核；复核结论登记在 `state/review.json`。"
+                 % (MIN_TRADES, HOLD_REVIEW_DAYS))
     L.append("")
 
     # ---- 实测 ----
@@ -437,10 +495,21 @@ def render_markdown(summary, gate_info, issues, bt, acc, audit=None, notes=None)
     L.append("| 完成交易 | %d 笔 | %d 笔 |" % (recent["n"], total["n"]))
     L.append("| 胜率 | %.1f%% | %.1f%% |"
              % (recent["win_rate"], total["win_rate"]))
-    L.append("| 净盈亏 | ¥%+.2f | ¥%+.2f |" % (recent["pnl"], total["pnl"]))
+    # 2026-11-07 修：「净盈亏」列一直是**已实现**，但标签写着「净」，与下面
+    # 市值口径的账户权益直接打架（11-06：净盈亏 -80.50，权益却是 9763.70）。
+    # 10-23 修过一次同类问题（权益按成本价算，浮盈全丢），这里是另一半：
+    # 口径对了，标签还在骗人。改成「已实现」，并显式补一行未实现。
+    unreal = equity_val - init - total["pnl"]
+    L.append("| 已实现净盈亏 | ¥%+.2f | ¥%+.2f |" % (recent["pnl"], total["pnl"]))
+    L.append("| 未实现浮动 | — | ¥%+.2f |" % unreal)
     L.append("| 单笔均值 | ¥%+.2f | ¥%+.2f |" % (recent["avg"], total["avg"]))
     L.append("| 最好 / 最差 | ¥%+.2f / ¥%+.2f | ¥%+.2f / ¥%+.2f |"
              % (recent["best"], recent["worst"], total["best"], total["worst"]))
+
+    L.append("")
+    L.append("> 已实现 + 未实现 = 累计 %.2f 元，与账户权益一致。"
+             "只看「已实现」会漏掉持仓浮亏，只看权益会不知道亏在哪个环节。"
+             % (total["pnl"] + unreal))
     L.append("")
     L.append("账户权益 ¥%.2f（初始 ¥%.0f，%s），本期 %d 个交易日中空仓 %d 天。"
              % (equity_val, init, equity_src,
@@ -566,7 +635,11 @@ def main():
     acc, trades, equity = load_all()
     summary = summarize(trades, equity, days=args.days)
     issues, notes = deviations(trades, equity, acc)
-    gate_info = gate(summary["total"]["n"], summary["n_days"])
+    hold_mode = str(strategy.PARAMS.get("mode") or "") == "hold"
+    last_review, days_since = review_age(equity)
+    gate_info = gate(summary["total"]["n"], summary["n_days"],
+                     hold_mode=hold_mode, days_since=days_since,
+                     last_review=last_review)
     # 即使样本未达标也跑回测：数据是否够用应由 try_backtest 自己判断，
     # 否则「样本不足」会被误报成「缓存不足」，掩盖真实状态。
     # 未达标时 render_markdown 会标注「仅供观察，不作为调参依据」。
