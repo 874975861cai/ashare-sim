@@ -164,6 +164,177 @@ def _limit_block(code, name, preclose, side, quote, px):
     return None
 
 
+def _day_axis(data, day):
+    """当日统一时间轴 + 每只标的的时间→索引。"""
+    tl, idx = set(), {}
+    for c, v in data.items():
+        if day in v["days"]:
+            ticks = v["days"][day]
+            idx[c] = {t["t"]: k for k, t in enumerate(ticks)}
+            tl |= set(idx[c])
+    return sorted(tl), idx
+
+
+def run_mix_backtest(data, params, days, capital=10000.0, verbose=False):
+    """组合模式（mode="mix"）的分钟级回放：09:35 调仓一次，其余时间持有。
+
+    为什么必须单独有一条路径（2026-11-07 补）：
+    回测原来只有「单标的、逐分钟 decide」一条路，而 mix 的决策在
+    `strategy.plan_mix` 里，`decide()` 根本走不到它。于是切到 mix 之后，
+    回归探针跑出来的「现行参数 0.00% / 0 笔」还是被报成「与基线一致」——
+    看起来每天都验过，实际上**现役策略一次都没被回放**。
+    更糟的是同一时期 plan_mix 自己带着一个「再平衡=清仓」的算术错误
+    （目标市值按可用现金算），而这个错误在盘面上要等一年才发作。
+
+    覆盖边界（写清楚，免得以后读代码的人高估它）：
+      · 只回放「建仓 / 移出旧仓 / 带外再平衡」的执行与记账，
+        年度尺度的收益与回撤仍由 hiret.py 的日线检验负责；
+      · 窗口通常只有 5 个交易日，所以再平衡多半只发生在首日。
+    """
+    cash = float(capital)
+    start = cash
+    equity = cash
+    positions = {}        # code -> {shares, cost(含买入费), entry, day}
+    trades, blocked, day_pnls = [], [], []
+    last_px = {}
+    last_rebal = ""
+    seen_blocks = set()
+    w_codes = list(params.get("mix_weights") or {})
+    mix_time = str(params.get("mix_time", "09:35"))
+
+    def note_block(day, c, side, t, why, tag=""):
+        key = (day, c, side, tag)
+        if key in seen_blocks:
+            return
+        seen_blocks.add(key)
+        blocked.append({"day": day, "code": c, "side": side, "t": t,
+                        "reason": why})
+
+    for day in days:
+        tlist, idxmap = _day_axis(data, day)
+        tgt_t = next((x for x in tlist if x[11:16] >= mix_time), None)
+        if tgt_t and strategy.mix_rebal_due(last_rebal, day, params):
+            # 成交价取 mix_time 那一根，与 runner 同口径：用更晚的价执行
+            # 09:35 的决定就是前视偏差。
+            prices = {}
+            for c in dict.fromkeys(w_codes + list(positions)):
+                k = idxmap.get(c, {}).get(tgt_t)
+                if k is None:
+                    continue          # 这一分钟没有 tick：今天不碰这只
+                prices[c] = data[c]["days"][day][k]["price"]
+            holdings = {c: p["shares"] for c, p in positions.items()}
+            eq = cash + sum(sh * (prices.get(c) or last_px.get(c)
+                                  or positions[c]["entry"])
+                            for c, sh in holdings.items())
+            orders, diag = strategy.plan_mix(eq, holdings, prices, params)
+            if verbose:
+                print("  %s [组合] 权益 %.2f，%d 条指令" % (day, eq, len(orders)))
+                for d in diag:
+                    print("         · %s" % d)
+            for o in orders:
+                c = o["code"]
+                p0 = prices.get(c)
+                if not p0:
+                    continue
+                pre = data[c]["preclose"].get(day)
+                if o["side"] == "SELL":
+                    pos = positions.get(c)
+                    if not pos:
+                        continue
+                    # T+1：当天买的份额当天卖不掉。组合里只有股票型 ETF 会撞上，
+                    # 而且只会在「刚建仓又要减」这种自相矛盾的情况下出现。
+                    if pos["day"] == day and not broker.is_t0_etf(c):
+                        note_block(day, c, "SELL", tgt_t,
+                                   "T+1 锁定：当日买入不可卖", tag="mix")
+                        continue
+                    sh = min(int(o["shares"]), pos["shares"]) // 100 * 100
+                    if sh < 100:
+                        continue
+                    q = p0
+                    px = broker.round_price(c, q - broker.price_tick(c))
+                    why = _limit_block(c, data[c]["name"], pre, "SELL", q, px)
+                    if why:
+                        note_block(day, c, "SELL", tgt_t, why, tag="mix")
+                        continue
+                    amt = px * sh
+                    fee = broker.calc_fee(c, "SELL", amt)
+                    cps = pos["cost"] / pos["shares"]      # 每股成本（含买入费）
+                    proceeds = amt - fee["total"]
+                    cash += proceeds
+                    trades.append({"day": day, "code": c,
+                                   "name": data[c]["name"], "side": "SELL",
+                                   "t": tgt_t, "price": px, "shares": sh,
+                                   "pnl": proceeds - cps * sh,
+                                   "reason": o["reason"]})
+                    pos["shares"] -= sh
+                    pos["cost"] = cps * pos["shares"]
+                    if pos["shares"] <= 0:
+                        positions.pop(c, None)
+                else:
+                    # 现金约束与 runner 同口径：留 5 元佣金 + 0.1% 价格缓冲
+                    budget = cash - 5.0
+                    sh = min(int(o["shares"]),
+                             int(budget / (p0 * 1.001) / 100) * 100)
+                    if sh < 100:
+                        note_block(day, c, "BUY", tgt_t, "现金不足一手")
+                        continue
+                    q = p0
+                    px = broker.round_price(c, q + broker.price_tick(c))
+                    why = _limit_block(c, data[c]["name"], pre, "BUY", q, px)
+                    if why:
+                        note_block(day, c, "BUY", tgt_t, why, tag="mix")
+                        continue
+                    amt = px * sh
+                    fee = broker.calc_fee(c, "BUY", amt)
+                    if amt + fee["total"] > cash:
+                        note_block(day, c, "BUY", tgt_t,
+                                   "成交额 %.2f + 费用超过现金 %.2f"
+                                   % (amt, cash))
+                        continue
+                    cash -= amt + fee["total"]
+                    old = positions.get(c)
+                    if old:
+                        old["shares"] += sh
+                        old["cost"] += amt + fee["total"]
+                    else:
+                        positions[c] = {"shares": sh, "cost": amt + fee["total"],
+                                        "entry": px, "day": day}
+                    trades.append({"day": day, "code": c,
+                                   "name": data[c]["name"], "side": "BUY",
+                                   "t": tgt_t, "price": px, "shares": sh,
+                                   "pnl": 0.0, "reason": o["reason"]})
+            if orders:
+                # 同 runner：只有「权重都回到带内」才算调仓完成。否则明天重试，
+                # 不能让一次被拒单/缺报价的半成品顶掉整年的再平衡。
+                hold2 = {c: p["shares"] for c, p in positions.items()}
+                eq2 = cash + sum(sh * (prices.get(c) or last_px.get(c)
+                                       or positions[c]["entry"])
+                                 for c, sh in hold2.items())
+                if strategy.mix_on_target(eq2, hold2, prices, params):
+                    last_rebal = day
+                elif verbose:
+                    print("         ! 调仓后仍有标的脱靶，不记调仓日，次日重试")
+
+        equity = cash
+        for c, p in positions.items():
+            if day in data.get(c, {}).get("days", {}):
+                px_end = data[c]["days"][day][-1]["price"]
+                last_px[c] = px_end
+            else:
+                px_end = last_px.get(c) or p["entry"]
+            equity += px_end * p["shares"]
+        day_pnls.append(round(equity - start, 2))
+        start = equity
+        if verbose:
+            print("  %s  权益 %9.2f  现金 %9.2f  持仓 %d 只"
+                  % (day, equity, cash, len(positions)))
+
+    return {"final": round(equity, 2), "trades": trades, "day_pnls": day_pnls,
+            "open_pos": None,
+            "open_positions": {c: p["shares"] for c, p in positions.items()},
+            "blocked": blocked, "capital": capital, "mode": "mix"}
+
+
 def run_backtest(data, params, days, capital=10000.0, verbose=False):
     """组合回放：单票集中，全池扫描。
 
@@ -181,6 +352,12 @@ def run_backtest(data, params, days, capital=10000.0, verbose=False):
     cash = capital
     equity_val = capital
     start_equity = capital
+    if params.get("mode") == "mix":
+        # mix 的决策在 strategy.plan_mix 里，单标的的 decide 循环走不到它。
+        # 不分流的话这里会「正常地」跑完一天不动，返回 0 笔 —— 一个看起来
+        # 完全健康的假结果。
+        return run_mix_backtest(data, params, days, capital=capital,
+                                verbose=verbose)
     pos = None            # {code, entry, entry_idx, t, shares, day, overnight}
     trades = []
     blocked = []          # 被涨跌停/封板挡下的单子，不能静默丢
@@ -453,18 +630,31 @@ def run_backtest(data, params, days, capital=10000.0, verbose=False):
             print(f"  {day}  日盈亏 {day_pnl:+8.2f}  权益 {equity_val:9.2f}")
 
     return {"final": round(equity_val, 2), "trades": trades,
-            "day_pnls": day_pnls, "open_pos": pos, "blocked": blocked}
+            "day_pnls": day_pnls, "open_pos": pos, "blocked": blocked,
+            "capital": capital, "mode": params.get("mode") or "daytrade"}
 
 
 def metrics(res, capital=10000.0):
+    """收益口径必须用「这次回放真正用了多少本金」，不能靠调用方记得传。
+
+    本金默认值一直是 10000，而 2026-11-09 账本本金已加到 10 万：
+    `run_backtest(capital=100000)` 配上不带参的 `metrics(r)`，
+    ret_pct 会静默缩成实际的 1/10 —— 一个整数误差，看着完全正常。
+    所以本金随结果返回，metrics 优先读它。
+    """
+    capital = float(res.get("capital") or capital)
     sells = [t for t in res["trades"] if t["side"] == "SELL"]
     wins = [t for t in sells if t["pnl"] > 0]
     n = len(sells)
     op = res.get("open_pos") or None
+    opens = res.get("open_positions") or {}
     return {
         "ret_pct": round((res["final"] / capital - 1) * 100, 3),
         "pnl": round(res["final"] - capital, 2),
         "trades": n,
+        # 「笔数」历来只数卖出（=完整往返），但组合模式的建仓只有买入，
+        # 只报 0 笔会读成「什么都没发生」。两个口径都给出，别让读者去猜。
+        "fills": len(res["trades"]),
         "win_rate": round(len(wins) / n * 100, 1) if n else 0.0,
         "avg_pnl": round(sum(t["pnl"] for t in sells) / n, 2) if n else 0.0,
         # 0 笔时返回 None，不返回 0.00：一笔没成交和「最好那笔刚好打平」
@@ -474,7 +664,9 @@ def metrics(res, capital=10000.0):
         # 回放窗口结束时还握着仓位：ret_pct 里含着未平仓市值，不能当成
         # 「已实现收益」看。以前这个信息只藏在 res 里，metrics 一取就没了，
         # 报告读起来像「1 笔完整往返」，实际是「1 笔买入 + 1 笔从未离场」。
+        # 组合模式有多个未平仓标的，单给它一个 code 会让人以为只有一只。
         "open_code": op["code"] if op else None,
         "open_shares": op["shares"] if op else 0,
+        "open_n": len(opens) if opens else (1 if op else 0),
         "blocked": len(res.get("blocked") or []),
     }

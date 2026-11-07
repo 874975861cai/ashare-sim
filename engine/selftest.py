@@ -46,7 +46,7 @@ VERBOSE = False
 CASES = []
 # 用例总数基线（见 main() 里的说明：少了要红，不是"通过 41 项"）。
 # 2026-10-19 建 1 条起算，每加一条用例都要同步改这里。
-EXPECTED_CASES = 49
+EXPECTED_CASES = 53
 
 
 def case(name):
@@ -678,6 +678,134 @@ def t_mix_band():
           "纳指脱靶却没减仓：%s" % o2)
     check(all(o["shares"] % 100 == 0 for o in o2),
           "下单必须是整手：%s" % o2)
+
+
+@case("组合：再平衡只拉回权重，不能清仓、也不能反向卖低配的那只")
+def t_mix_rebal():
+    """2026-11-07 实测：目标市值按「可用现金」算，满仓再平衡 = 清仓。
+
+    旧代码拿 budget（= 现有现金 + 卖出所得）乘权重算目标股数。满仓时
+    现金≈0，于是每个目标都算成 0：
+      · 57%（目标 40%）的 513100 被整笔卖出 31600 份，不是减到 40%；
+      · 21%（目标 30%）的两只「在带内不动」，腾出的 5.7 万现金躺到明年；
+      · 更荒诞的一组：低配到 15% 的 159915 也被「减至 30%(现 15%)」卖掉 4450 份。
+    两个方向都错，而流水上的理由文字完全正常，事后只看得见「减至 30%」。
+    """
+    px = {"513100": 1.80, "518880": 3.60, "159915": 2.40}
+    w = strategy.PARAMS["mix_weights"]
+    # 60/20/20 量级的漂移：只有纳指脱靶
+    h = {"513100": 31600, "518880": 6100, "159915": 8700}
+    eq = sum(h[c] * px[c] for c in h)
+    orders, diag = strategy.plan_mix(eq, h, px)
+    got = {o["code"]: (o["side"], o["shares"]) for o in orders}
+    check(got.get("513100", ("", 0))[0] == "SELL",
+          "纳指脱靶却没减仓：%s" % orders)
+    check(got.get("513100", ("", 0))[1] < h["513100"] * 0.8,
+          "减仓幅度太小，没拉回目标：卖 %d / 持有 %d"
+          % (got.get("513100", ("", 0))[1], h["513100"]))
+    check(got.get("513100", ("", 0))[1] > 0,
+          "再把平衡当成清仓了：卖出全部 %d 份" % h["513100"])
+    for c in ("518880", "159915"):
+        check(got.get(c, ("", 0))[0] != "SELL",
+              "低配的 %s 被卖出了：%s（应买不应卖）" % (c, orders))
+    # 按指令执行后，三只权重都应回到目标附近（±3pp），现金不留大块
+    after = dict(h)
+    for o in orders:
+        after[o["code"]] += o["shares"] if o["side"] == "BUY" else -o["shares"]
+    for c, wt in w.items():
+        real = after.get(c, 0) * px[c] / eq
+        check(abs(real - wt) < 0.03,
+              "%s 调仓后权重 %.1f%%，目标 %.0f%%（差得太多）"
+              % (c, real * 100, wt * 100))
+    check(any("触发全量再平衡" in d for d in diag), "没说明为什么调仓：%s" % diag)
+
+
+@case("组合：低配标的要求买进，不能被现金预算算成卖出")
+def t_mix_underweight():
+    """15% 对 30% 是欠配，必须买。旧代码把它算成「减至 30%」卖了 4450 份。"""
+    px = {"513100": 1.80, "518880": 3.60, "159915": 2.40}
+    h = {"513100": 22222, "518880": 8333, "159915": 6250}   # 40/30/15
+    cash = 15000.0
+    eq = sum(h[c] * px[c] for c in h) + cash
+    orders, _ = strategy.plan_mix(eq, h, px)
+    got = {o["code"]: o for o in orders}
+    check("159915" in got and got["159915"]["side"] == "BUY",
+          "欠配的 159915 没买进：%s" % orders)
+    check(not any(o["side"] == "SELL" for o in orders),
+          "没有超配标的，却产生了卖单：%s" % orders)
+
+
+@case("组合：权益非正 / 权重为空时必须停手，不能「合法地」清零仓位")
+def t_mix_guard():
+    px = {"513100": 1.80}
+    o, d = strategy.plan_mix(0.0, {"513100": 1000}, px)
+    check(not o, "权益为 0 时仍下了单：%s" % o)
+    o2, d2 = strategy.plan_mix(100000.0, {"513100": 1000}, px,
+                               dict(strategy.PARAMS, mix_weights={}))
+    check(not o2, "没有目标权重却下了单：%s" % o2)
+    # 「调仓算不算完成」的判定：缺一只报价就是判不了，不能算到位。
+    # 旧写法只看「有没有下过单」，会把半成品记成已完成，再等 342 天。
+    full = {"513100": 1.80, "518880": 3.60, "159915": 2.40}
+    ok_pos = {"513100": 22200, "518880": 8300, "159915": 12500}
+    check(strategy.mix_on_target(100000.0, ok_pos, full),
+          "三只都在带内却判成未到位")
+    check(not strategy.mix_on_target(100000.0, ok_pos,
+                                     {"513100": 1.80, "518880": 3.60}),
+          "缺 159915 报价却判成到位（等于把半成品记成已完成）")
+    check(not strategy.mix_on_target(100000.0,
+                                     {"513100": 40000, "518880": 8300,
+                                      "159915": 12500}, full),
+          "权重脱靶却判成到位")
+
+
+@case("组合回测：建仓、再平衡、本金口径")
+def t_bt_mix():
+    """切到 mix 之后，回归探针一直在跑「单标的 + 日内 decide」那条路。
+
+    mix 的决策在 plan_mix 里，decide 走不到它，于是回测返回 0 笔、
+    doctor 报「与基线一致」——现役策略一次都没被回放。这条用例钉三件事：
+      1) 首日按 40/30/30 建满三只；
+      2) 隔夜一只翻倍触发再平衡时，只减不换、且卖出所得要投回去（不留大块现金）；
+      3) metrics 的收益口径用回放本金，不靠调用方记得传参。
+    """
+    d1, d2 = "2026-11-02", "2026-11-03"
+    n = len(session_minutes())
+
+    def mk(c, p1, p2):
+        return {"name": c,
+                "days": {d1: mk_ticks(d1, flat_prices(n, p1)),
+                         d2: mk_ticks(d2, flat_prices(n, p2))},
+                "preclose": {d1: p1, d2: p1}, "first_day_no_preclose": d1}
+
+    data = {"513100": mk("513100", 1.80, 3.60),      # 第二天翻倍
+            "518880": mk("518880", 3.60, 3.60),
+            "159915": mk("159915", 2.40, 2.40)}
+    p = dict(strategy.PARAMS, mode="mix", mix_rebal_days=1)
+    cap = 100000.0
+    r = backtest.run_backtest(data, p, [d1, d2], capital=cap)
+    d1_buys = [t for t in r["trades"] if t["day"] == d1 and t["side"] == "BUY"]
+    check(len(d1_buys) == 3, "首日应建三只，实际 %d 笔：%s"
+          % (len(d1_buys), [(t["code"]) for t in d1_buys]))
+    check(sorted(r["open_positions"]) == ["159915", "513100", "518880"],
+          "期末持仓不对：%s" % r["open_positions"])
+    d2_sells = [t for t in r["trades"] if t["day"] == d2 and t["side"] == "SELL"]
+    check(len(d2_sells) == 1 and d2_sells[0]["code"] == "513100",
+          "再平衡应对且只对 513100 减仓：%s"
+          % [(t["code"], t["shares"]) for t in d2_sells])
+    before = [t["shares"] for t in d1_buys if t["code"] == "513100"][0]
+    check(0 < d2_sells[0]["shares"] < before,
+          "减仓幅度不对：卖 %d / 建仓 %d" % (d2_sells[0]["shares"], before))
+    eq_end = r["final"]
+    # 卖出腾出的钱必须投回欠配的标的：期末现金占权益不应超过 8%
+    mv_end = sum(r["open_positions"][c] * px for c, px in
+                 (("159915", 2.40), ("513100", 3.60), ("518880", 3.60)))
+    cash_ratio = (eq_end - mv_end) / eq_end
+    check(cash_ratio < 0.08,
+          "再平衡后留了 %.1f%% 现金（卖出所得没投回去）" % (cash_ratio * 100))
+    m = backtest.metrics(r)
+    check(m["fills"] == len(r["trades"]), "fills 与流水条数不一致")
+    check(abs(m["ret_pct"] - round((r["final"] / cap - 1) * 100, 3)) < 1e-6,
+          "收益口径没用回放本金：%.3f%%" % m["ret_pct"])
 
 
 @case("日内模式仍可切换：daytrade 下兜底强平必须生效")

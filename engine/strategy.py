@@ -361,6 +361,43 @@ def decide(ticks, i, pos, ctx, params=PARAMS, can_sell=True):
 
 
 # ---------------- 组合层决策（mode="mix"） ----------------
+def _mix_weights(params=PARAMS):
+    """归一化后的目标权重。归一这一步旧注释承诺过、代码却没做：
+    权重和 1.2 时会按 1.2 倍下单，最后一只必然被现金裁掉。"""
+    raw = {}
+    for c, v in (params.get("mix_weights") or {}).items():
+        try:
+            fv = float(v)
+        except (TypeError, ValueError):
+            continue
+        if fv > 0:
+            raw[c] = fv
+    tot = sum(raw.values())
+    return {c: v / tot for c, v in raw.items()} if tot > 0 else {}
+
+
+def mix_on_target(equity, holdings, prices, params=PARAMS):
+    """所有目标标的的权重是否都已在带内。
+
+    用来决定「这次调仓算不算完成」。以前只看「有没有下过单」就记
+    `mix_last_rebal`：某只标的当时没报价（QDII 常有）、或被涨停/现金
+    挡掉，组合会带着一块没投出去的钱，而下次再平衡要等 342 天。
+    没有报价一律算「判不了」= 未到位，宁可明日重试，也不要假装完成。
+    """
+    w = _mix_weights(params)
+    band = float(params.get("mix_band", 0.12))
+    if not w or not equity or equity <= 0:
+        return False
+    for c, wt in w.items():
+        p = prices.get(c)
+        if not p or p <= 0:
+            return False
+        cur_w = (int(holdings.get(c) or 0) * p) / equity
+        if abs(cur_w - wt) >= band:
+            return False
+    return True
+
+
 def plan_mix(equity, holdings, prices, params=PARAMS):
     """按目标权重生成调仓指令。返回 (orders, diag)。
 
@@ -372,57 +409,151 @@ def plan_mix(equity, holdings, prices, params=PARAMS):
     holdings : {code: 股数}（含旧策略遗留的、不在目标里的标的）
     prices   : {code: 现价}
     orders   : 卖出在前、买入在后 —— 先腾出现金再买，顺序不能反。
+
+    目标市值必须按 **equity** 算（目标权重 × 总权益），不能按「可用现金」算。
+    2026-11-07 实测的旧写法就是拿现金算的：满仓时可用现金≈0，于是每个标的
+    的目标股数都被算成 0，再平衡变成「把脱靶的那只全部清仓」——
+    31600 份 513100 该减到 40%，实际下了 31600 份的卖单；
+    而低配到 15% 的 159915 也被「减至 30%(现15%)」卖掉了 4450 份。
+    两个方向都错，且都以「减至/补至 XX%」的措辞落账，事后看完全正常。
+    现金只约束**买入**：卖出腾出的钱先到账，再按比例分配给要买的标的。
     """
-    w = dict(params.get("mix_weights") or {})
+    # 权重归一（和=1）后统一使用；旧代码没归一，权重和 1.2 时会按 1.2 倍下单。
+    w = _mix_weights(params)
     band = float(params.get("mix_band", 0.12))
+    try:
+        equity = float(equity)
+    except (TypeError, ValueError):
+        equity = 0.0
+    hold = {}
+    for c, sh in (holdings or {}).items():
+        try:
+            n = int(sh)
+        except (TypeError, ValueError):
+            continue
+        if n > 0:
+            hold[c] = n
     orders, diag = [], []
+    if not w:
+        return [], ["mix_weights 为空或全为非正数，不调仓"]
+    if equity <= 0:
+        # 权益非正时按比例算出来的目标全是 0，会把仓位「合法地」清零。
+        # 这是账本异常，不是调仓信号，必须停下来交给人看。
+        return [], ["权益 %.2f 非正，不调仓" % equity]
 
     # 1 不在目标里的旧持仓：全额卖出。
     #   2026-11-07 这次从 510880 换到组合，第一次运行就靠这条清掉红利仓。
-    for c, sh in sorted((holdings or {}).items()):
-        if c in w or not sh or sh <= 0:
+    evict = []
+    for c in sorted(hold):
+        if c in w:
             continue
         if not prices.get(c):
-            diag.append("%s 无报价，暂不卖出" % c)
+            diag.append("%s 无报价，暂不卖出（市值按 0 计入预算）" % c)
             continue
-        orders.append({"code": c, "side": "SELL", "shares": int(sh),
-                       "reason": "移出组合"})
+        evict.append({"code": c, "side": "SELL", "shares": hold[c],
+                      "reason": "移出组合"})
 
-    # 2 目标标的：带内不动，带外拉回目标。
+    # 2 目标标的：先算「要不要动」，再算「动谁」。
     #
-    # 现金预算：目标市值按 equity 算，但实际可用现金只有「现有现金 + 卖出所得」，
-    # 且要留出佣金和整手零头。不留这一手，最后一只必然被现金裁掉——
-    # 2026-11-07 写用例时实测：40/30/30 建仓只买成了第一只（159915），
-    # 后两只全是「现金不足一手」。所以先算预算，再按预算比例分配。
-    mv = sum(int((holdings or {}).get(c) or 0) * prices[c]
-             for c in (holdings or {}) if prices.get(c))
-    cash_now = max(equity - mv, 0.0)
-    sell_in = sum(o["shares"] * (prices.get(o["code"]) or 0)
-                  for o in orders if o["side"] == "SELL")
-    budget = (cash_now + sell_in) * 0.995      # 0.5% 留作佣金与整手零头
-
-    for c, wt in sorted(w.items()):
+    # 带（mix_band）只决定**触发**，不决定**只动哪一只**。这个区分是必须的：
+    # 只减超配那一只、其余照带内不动，剩下的现金会躺到下一次再平衡（约一年），
+    # 组合实际变成「40/21/21+18%现金」——比不调仓还偏。
+    # 2026-11-07 实测：纳指翻倍触发减仓，卖出后 2.4 万现金闲置。
+    # 所以一旦有标的脱靶，就把所有标的拉回目标（经典 band rebalance：
+    # 触发频率低、单次全量、总成本反而更低）。
+    plans = []
+    trigger = ""
+    for c in sorted(w):
+        wt = w[c]
         p = prices.get(c)
         if not p or p <= 0:
             diag.append("%s 无报价，跳过" % c)
             continue
-        cur = int((holdings or {}).get(c) or 0)
-        cur_w = (cur * p / equity) if equity else 0.0
-        if cur > 0 and abs(cur_w - wt) < band:
+        cur = hold.get(c, 0)
+        cur_w = cur * p / equity
+        # 目标股数按整手向下取整：宁可少买一手，不要为凑整超配
+        tgt = int(equity * wt / p / 100) * 100
+        plans.append({"code": c, "wt": wt, "cur": cur, "cur_w": cur_w,
+                      "tgt": tgt, "diff": tgt - cur})
+        if not trigger and abs(cur_w - wt) >= band:
+            trigger = "%s 权重 %.1f%% 偏离目标 %.0f%% 超过带宽 %.0f%%" % (
+                c, cur_w * 100, wt * 100, band * 100)
+
+    trims, buys = [], []
+    if not trigger:
+        for x in plans:
             diag.append("%s 权重%.1f%%(目标%.1f%%)在带内"
-                        % (c, cur_w * 100, wt * 100))
-            continue
-        tgt = int(budget * wt / p / 100) * 100
-        diff = tgt - cur
-        if diff >= 100:
-            orders.append({"code": c, "side": "BUY", "shares": diff,
-                           "reason": "补至%.0f%%(现%.0f%%)"
-                                     % (wt * 100, cur_w * 100)})
-        elif diff <= -100:
-            orders.append({"code": c, "side": "SELL", "shares": -diff,
-                           "reason": "减至%.0f%%(现%.0f%%)"
-                                     % (wt * 100, cur_w * 100)})
-    return orders, diag
+                        % (x["code"], x["cur_w"] * 100, x["wt"] * 100))
+    else:
+        diag.append("触发全量再平衡：%s" % trigger)
+        for x in plans:
+            if x["diff"] >= 100:
+                buys.append({"code": x["code"], "side": "BUY",
+                             "shares": x["diff"],
+                             "reason": "补至%.0f%%(现%.0f%%)"
+                                       % (x["wt"] * 100, x["cur_w"] * 100)})
+            elif x["diff"] <= -100:
+                trims.append({"code": x["code"], "side": "SELL",
+                              "shares": -x["diff"],
+                              "reason": "减至%.0f%%(现%.0f%%)"
+                                        % (x["wt"] * 100, x["cur_w"] * 100)})
+            else:
+                diag.append("%s 已在目标附近，不动" % x["code"])
+
+    # 3 现金只约束买入：可用 = 现有现金 + 卖出所得，留 0.5% 给佣金与整手零头。
+    mv_priced = sum(sh * prices[c] for c, sh in hold.items() if prices.get(c))
+    lost = [c for c in hold if not prices.get(c)]
+    if lost:
+        # 没报价的持仓既卖不掉也无法估值，equity 里却已经算过它（调用方按成本估），
+        # 于是 cash_now 会被高估。必须说出来，否则以为「现金够」，实际被券商拒单。
+        diag.append("%s 无报价，可用现金可能被高估" % "、".join(sorted(lost)))
+    cash_now = max(equity - mv_priced, 0.0)
+    sell_in = sum(o["shares"] * prices[o["code"]]
+                  for o in evict + trims if prices.get(o["code"]))
+    avail = (cash_now + sell_in) * 0.995
+    need = sum(o["shares"] * prices[o["code"]] for o in buys)
+    if need > avail:
+        scale = (avail / need) if need else 0.0
+        scaled = []
+        for o in buys:
+            sh = int(o["shares"] * scale) // 100 * 100
+            if sh >= 100:
+                # 缩量到 99.x% 是常态（留了佣金与整手零头），别为此改写指令理由，
+                # 否则每条买单都挂一句「按可用现金缩量」，真正的缩量反而看不出来。
+                why = o["reason"] + ("，按可用现金缩量" if scale < 0.95 else "")
+                scaled.append({**o, "shares": sh, "reason": why})
+        diag.append("买入需 %.0f 元 > 可用 %.0f 元，按 %.1f%% 缩量"
+                    % (need, avail, scale * 100))
+        buys = scaled
+
+    return evict + trims + buys, diag
+    # 3 现金只约束买入：可用 = 现有现金 + 卖出所得，留 0.5% 给佣金与整手零头。
+    mv_priced = sum(sh * prices[c] for c, sh in hold.items() if prices.get(c))
+    lost = [c for c in hold if not prices.get(c)]
+    if lost:
+        # 没报价的持仓既卖不掉也无法估值，equity 里却已经算过它（调用方按成本估），
+        # 于是 cash_now 会被高估。必须说出来，否则以为「现金够」，实际被券商拒单。
+        diag.append("%s 无报价，可用现金可能被高估" % "、".join(sorted(lost)))
+    cash_now = max(equity - mv_priced, 0.0)
+    sell_in = sum(o["shares"] * prices[o["code"]]
+                  for o in evict + trims if prices.get(o["code"]))
+    avail = (cash_now + sell_in) * 0.995
+    need = sum(o["shares"] * prices[o["code"]] for o in buys)
+    if need > avail:
+        scale = (avail / need) if need else 0.0
+        scaled = []
+        for o in buys:
+            sh = int(o["shares"] * scale) // 100 * 100
+            if sh >= 100:
+                # 缩量到 99.x% 是常态（留了佣金与整手零头），别为此改写指令理由，
+                # 否则每条买单都挂一句「按可用现金缩量」，真正的缩量反而看不出来。
+                why = o["reason"] + ("，按可用现金缩量" if scale < 0.95 else "")
+                scaled.append({**o, "shares": sh, "reason": why})
+        diag.append("买入需 %.0f 元 > 可用 %.0f 元，按 %.1f%% 缩量"
+                    % (need, avail, scale * 100))
+        buys = scaled
+
+    return evict + trims + buys, diag
 
 
 def mix_rebal_due(last_day, day, params=PARAMS):

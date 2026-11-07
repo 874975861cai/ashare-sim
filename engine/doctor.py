@@ -326,20 +326,30 @@ def selftest_overnight():
     """
     fails = []
     one = {"510880": {"lots": [{"date": "2026-10-29", "shares": 2900, "price": 3.4}]}}
+    mix3 = ("159915", "513100", "518880")
+    three = {"513100": {"lots": [{"date": "2026-11-09", "shares": 22100}]},
+             "518880": {"lots": [{"date": "2026-11-09", "shares": 8200}]},
+             "159915": {"lots": [{"date": "2026-11-09", "shares": 12400}]}}
     cases = [
-        (one, "2026-10-30", 16, "hold", "510880", OK,
+        (one, "2026-10-30", 16, "hold", "510880", (), OK,
          "持有型过夜属设计内，应以 OK 说明，不该报警"),
-        (one, "2026-10-30", 16, "daytrade", "", WARN,
+        (one, "2026-10-30", 16, "daytrade", "", (), WARN,
          "日内策略过夜必须报警"),
-        (one, "2026-10-30", 10, "daytrade", "", None,
+        (one, "2026-10-30", 10, "daytrade", "", (), None,
          "收盘前持仓是当天建的，不算过夜"),
         ({"510300": {"lots": [{"date": "2026-10-29"}]}}, "2026-10-30", 16,
-         "hold", "510880", WARN,
+         "hold", "510880", (), WARN,
          "持有型却持有非目标标的，必须报警"),
-        ({}, "2026-10-30", 16, "hold", "510880", None, "空仓不该报警"),
+        ({}, "2026-10-30", 16, "hold", "510880", (), None, "空仓不该报警"),
+        # 组合模式（2026-11-07 转 mix 后补）：三只标的过夜是设计，不该天天报警；
+        # 但组合外的旧持仓必须报——那是「移出组合」没执行成功。
+        (three, "2026-11-10", 16, "mix", "", mix3, OK,
+         "组合持仓过夜属设计内，不该按日内口径报警"),
+        (one, "2026-11-10", 16, "mix", "", mix3, WARN,
+         "组合里却持有 510880，说明移出组合没成功，必须报警"),
     ]
-    for positions, d, h, mode, tgt, want, why in cases:
-        got, _ = overnight_judgment(positions, d, h, mode, tgt)
+    for positions, d, h, mode, tgt, mix, want, why in cases:
+        got, _ = overnight_judgment(positions, d, h, mode, tgt, mix)
         if got != want:
             fails.append("过夜仓判定错误（%s）：得到 %s，应为 %s" % (why, got, want))
     return fails
@@ -800,18 +810,24 @@ def _strategy_mode():
     try:
         import strategy
         return (str(strategy.PARAMS.get("mode") or "daytrade"),
-                str(strategy.PARAMS.get("hold_target") or ""))
+                str(strategy.PARAMS.get("hold_target") or ""),
+                tuple(sorted((strategy.PARAMS.get("mix_weights") or {}))))
     except Exception:  # noqa: BLE001
-        return "daytrade", ""
+        return "daytrade", "", ()
 
 
-def overnight_judgment(positions, today, hour, mode="daytrade", hold_target=""):
+def overnight_judgment(positions, today, hour, mode="daytrade", hold_target="",
+                       mix_codes=()):
     """判断「收盘后还持有前一日的仓位」是故障还是设计。纯函数，方便自测。
 
     日内策略收盘必须清空，有仓就是执行问题；持有型（mode="hold"）本来
     就要过夜，这时再喊「违反日内平仓」等于把正常和故障揉成同一句话，
     喊多了真漏平仓那天反而没人看。持有型真正该报的是「持有非目标标的」，
     那说明账本和策略已经不一致。
+
+    mode="mix"（2026-11-07 三次转向后）同理：三只组合标的本来就要过夜，
+    旧口径会给每一天都报一次「日内策略应清空」。组合真正该报的是
+    「持有组合外的标的」——那是 plan_mix 的「移出组合」没执行成功。
     """
     stale = sorted({(c, str(l.get("date"))) for c, p in (positions or {}).items()
                     for l in (p.get("lots") or []) if str(l.get("date")) != today})
@@ -824,6 +840,15 @@ def overnight_judgment(positions, today, hour, mode="daytrade", hold_target=""):
             return WARN, "持有型目标 %s，却持有 %s（账本与策略口径不一致）" % (
                 hold_target, "、".join(off))
         return OK, "%s 为持有型持仓（mode=hold），过夜属设计内" % shown
+    if str(mode) == "mix":
+        tgt = set(mix_codes or ())
+        off = sorted({c for c, _ in stale if c not in tgt})
+        if off:
+            return WARN, ("组合外持仓 %s（目标组合 %s），应由 plan_mix 的「移出组合」"
+                          "清掉；连续多日仍在说明清仓没执行成功"
+                          % ("、".join(off), "/".join(mix_codes) or "未配置"))
+        return OK, "%s 为组合持仓（mode=mix，共 %d 只），过夜属设计内" % (
+            shown, len(tgt))
     return WARN, "收盘后仍有前一日建仓：%s（日内策略应清空）" % shown
 
 
@@ -906,10 +931,10 @@ def check_ledger():
     # 口径必须跟着策略走：2026-10-28 起 mode="hold"，过夜是设计目标。
     # 旧判定只认日内口径，于是每天收盘都对一笔正常持仓喊「应清空」——
     # runner._warn_overnight 早就区分 hold_mode 了，检查器却没跟上（2026-10-30 修）。
-    mode, hold_target = _strategy_mode()
+    mode, hold_target, mix_codes = _strategy_mode()
     now = datetime.now()
     lvl, msg = overnight_judgment(positions, now.strftime("%Y-%m-%d"),
-                                  now.hour, mode, hold_target)
+                                  now.hour, mode, hold_target, mix_codes)
     if lvl:
         add(lvl, "账本", "过夜仓", msg)
 
@@ -1292,6 +1317,12 @@ def check_backtest_baseline():
         live_p = dict(strategy.PARAMS)
         probe_p = dict(strategy.PARAMS)
         probe_p["entry_enabled"] = True
+        mode = str(strategy.PARAMS.get("mode") or "daytrade")
+        # 探针口径跟着策略模式走：mix 的决策在 plan_mix 里，日内路径根本走不到它。
+        # 2026-11-07 切 mix 后，「现行参数 0.00% / 0 笔」被当成了「与基线一致」，
+        # 而它真正的意思是「这一行什么都没量」。口径要存进基线，否则下次换模式
+        # 会把「口径变了」报成「代码退化」。
+        probe_kind = "mix" if mode == "mix" else "daytrade"
         m = backtest.metrics(backtest.run_backtest(data, probe_p, days))
         m_live = backtest.metrics(backtest.run_backtest(data, live_p, days))
         ret = round(float(m.get("ret_pct", 0)), 4)
@@ -1314,14 +1345,25 @@ def check_backtest_baseline():
         tail += "；其中 %d 只用旧缓存（见「数据 回测数据集」）" % len(rep["degraded"])
     live_txt = "现行参数 %.2f%% / %d 笔" % (float(m_live.get("ret_pct", 0)),
                                           int(m_live.get("trades", 0)))
+    if mode == "mix":
+        # 组合模式的「笔」只数卖出，建仓那几笔买入全在 fills 里。不分开写，
+        # 「0 笔」会被读成「回测什么都没发生」或「策略没建仓」。
+        live_txt = "现行参数 %.2f%%（成交 %d 笔：买入 %d / 卖出 %d）" % (
+            float(m_live.get("ret_pct", 0)), int(m_live.get("fills", 0)),
+            int(m_live.get("fills", 0)) - int(m_live.get("trades", 0)),
+            int(m_live.get("trades", 0)))
     if m_live.get("open_code"):
         live_txt += "，期末仍持有 %s %d 份（未平仓，收益含浮动）" % (
             m_live["open_code"], m_live["open_shares"])
+    elif int(m_live.get("open_n") or 0) > 1:
+        live_txt += ("，期末持有 %d 只组合标的未平仓（收益含浮动；分钟级只覆盖 "
+                     "09:35 调仓与持有，年度收益与回撤见 hiret.py）"
+                     % int(m_live["open_n"]))
 
     def save():
         with open(base_f, "w", encoding="utf-8") as f:
             json.dump({"ret_pct": ret, "trades": n, "days": days,
-                       "params": sig, "code": _code_sig(),
+                       "params": sig, "code": _code_sig(), "probe": probe_kind,
                        "saved": datetime.now().strftime("%Y-%m-%d %H:%M")},
                       f, ensure_ascii=False, indent=2)
 
@@ -1375,6 +1417,15 @@ def check_backtest_baseline():
         add(OK, "回归", "回测基线",
             "策略参数变更（%s → %s），已按新参数重设基线 探针 %.2f%% / %d 笔（%s）%s"
             % (base.get("params") or "未记录", sig, ret, n, live_txt, tail))
+        return
+
+    if base.get("probe") != probe_kind:
+        # 探针口径变了（日内 ↔ 组合）。这两个口径量的根本不是同一件事，
+        # 拿新旧结果比「漂移」是假警报；但也不能默默重设——要说清旧基线是什么口径。
+        save()
+        add(OK, "回归", "回测基线",
+            "回归探针口径变更（%s → %s），已按新口径重设基线 探针 %.2f%% / %d 笔（%s）%s"
+            % (base.get("probe") or "未记录", probe_kind, ret, n, live_txt, tail))
         return
 
     drift = abs(ret - float(base.get("ret_pct", 0)))

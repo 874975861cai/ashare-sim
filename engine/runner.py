@@ -485,7 +485,22 @@ def run(verbose=True, params=None, execute=True, ttl=600):
                         events.append({"t": tgt_t, "act": "REJECT", "code": c,
                                        "reason": str(e)})
             if orders:
-                acc["mix_last_rebal"] = day
+                # 「下过单」≠「已经到位」。某只标的当时没报价（QDII 常有）、
+                # 或被涨停/现金挡掉，组合会带着一块没投出去的钱，而记了
+                # mix_last_rebal 之后，下一次再平衡要等 342 天。
+                # 所以用「权重是否都在带内」来判定完成，没到位就明天再试。
+                hold2 = {c: broker.position_shares(p)
+                         for c, p in (acc.get("positions") or {}).items()}
+                eq2 = float(acc["cash"])
+                for c, sh in hold2.items():
+                    p0 = prices.get(c) or broker.avg_cost(acc["positions"][c])
+                    eq2 += sh * p0
+                if strategy.mix_on_target(eq2, hold2, prices, params):
+                    acc["mix_last_rebal"] = day
+                elif verbose:
+                    print("  [组合] 调仓后仍有标的脱靶或没有报价，不记调仓日，"
+                          "下一轮重试（否则要等 %d 个交易日）"
+                          % int(params.get("mix_rebal_days", 244)))
             continue
 
         # 大盘涨跌不再在这里更新：它必须与「决策那一根」对齐（见上面的 asof_pct）。
