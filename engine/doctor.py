@@ -1272,6 +1272,25 @@ def _check_dataset_window(data, rep, backtest, strategy):
             "%d 只 × %d 天，同一天写入，横截面完整" % (h["codes"], h["span"]))
 
 
+def universe_shift(old, new):
+    """标的覆盖变化的方向：grew / shrank / changed / ""（无变化或无从比较）。
+
+    为什么单独判（2026-11-08）：基线只记「交易日列表」，而缓存补上一只标的
+    并不改变交易日列表。当天 warmup 补上 513100（13 只 → 14 只）后，探针从
+    1.28% 变 -0.16%，days 一模一样、参数指纹一模一样、代码指纹也一模一样，
+    于是报成「同一份数据、所以是代码行为变了」——那句话会把排查引向一个
+    根本不存在的代码退化。数据变宽/变窄本身就是结果会变的理由，必须分开说。
+    """
+    a, b = set(old or ()), set(new or ())
+    if not a or a == b:
+        return ""
+    if a < b:
+        return "grew"
+    if b < a:
+        return "shrank"
+    return "changed"
+
+
 def check_backtest_baseline():
     """同一份缓存、同一套参数，回测结果每次必须一样。
 
@@ -1314,6 +1333,7 @@ def check_backtest_baseline():
         if not days:
             add(WARN, "回归", "回测基线", "无完整交易日")
             return
+        universe = sorted(data)
         live_p = dict(strategy.PARAMS)
         probe_p = dict(strategy.PARAMS)
         probe_p["entry_enabled"] = True
@@ -1363,6 +1383,7 @@ def check_backtest_baseline():
     def save():
         with open(base_f, "w", encoding="utf-8") as f:
             json.dump({"ret_pct": ret, "trades": n, "days": days,
+                       "universe": universe,
                        "params": sig, "code": _code_sig(), "probe": probe_kind,
                        "saved": datetime.now().strftime("%Y-%m-%d %H:%M")},
                       f, ensure_ascii=False, indent=2)
@@ -1372,6 +1393,41 @@ def check_backtest_baseline():
         save()
         add(OK, "回归", "回测基线",
             "首次建立基线 探针 %.2f%% / %d 笔（%s）%s" % (ret, n, live_txt, tail))
+        return
+
+    # 交易日没变、但标的覆盖变了：这是「数据换了」，不是「代码变了」。
+    # 必须卡在 days 比较之前，否则 days 相等就会走到漂移判定，把补数据报成退化。
+    if "universe" not in base:
+        # 老基线只记了交易日。补记覆盖，并明确说出「这一次的差异归因不了」——
+        # 不能默默 save()，否则「重设了基线」会把一次真退化盖成绿色。
+        code_same = base.get("code") == _code_sig()
+        save()
+        add(OK if code_same else WARN, "回归", "回测基线",
+            "旧基线未记录标的覆盖，已补记为 %d 只并按当前数据集重设基线 "
+            "探针 %.2f%% / %d 笔（旧基线 %.2f%% / %d 笔）%s"
+            % (len(universe), ret, n, float(base.get("ret_pct", 0)),
+               base.get("trades", 0),
+               "；回测代码指纹未变 %s" % _code_sig() if code_same
+               else "；回测代码也变过，这次差异归因不了"))
+        return
+
+    shift = universe_shift(base.get("universe"), universe)
+    if shift:
+        code_same = base.get("code") == _code_sig()
+        save()
+        lvl = OK if (shift == "grew" and code_same) else WARN
+        add(lvl, "回归", "回测基线",
+            "回测数据集标的覆盖%s（%d 只 → %d 只：%s），已按新数据集重设基线 "
+            "探针 %.2f%% / %d 笔（旧基线 %.2f%% / %d 笔，交易日未变所以此前会被"
+            "误报成代码漂移）%s"
+            % ({"grew": "变宽", "shrank": "变窄"}.get(shift, "换了一批"),
+               len(base.get("universe") or []), len(universe),
+               "、".join(sorted(set(universe) - set(base.get("universe") or []))[:4])
+               or "移除 " + "、".join(sorted(set(base.get("universe") or [])
+                                            - set(universe))[:4]),
+               ret, n, float(base.get("ret_pct", 0)), base.get("trades", 0),
+               "；回测代码指纹未变 %s，可判定为数据变化" % _code_sig() if code_same
+               else "；回测代码同时变过，无法区分数据/代码"))
         return
 
     if base.get("days") != days:

@@ -46,7 +46,7 @@ VERBOSE = False
 CASES = []
 # 用例总数基线（见 main() 里的说明：少了要红，不是"通过 41 项"）。
 # 2026-10-19 建 1 条起算，每加一条用例都要同步改这里。
-EXPECTED_CASES = 55
+EXPECTED_CASES = 56
 
 
 def case(name):
@@ -1804,6 +1804,23 @@ def t_split_conflict():
     # baseline.json 脏但云端没动它，与本函数无关
     block3, align3 = doctor.split_conflict(dirty, set(), same)
     check(not block3 and not align3, "云端没动的脏文件不该进冲突集")
+
+
+@case("回归基线：标的覆盖变了不等于代码退化")
+def t_universe_shift():
+    """2026-11-08：warmup 补上 513100（13 只 → 14 只），交易日列表一天没变，
+    探针从 1.28% 变 -0.16%。旧逻辑只比 days，于是报「同一份数据、所以是
+    代码行为变了」——把人引向一个不存在的代码退化。
+
+    覆盖变宽/变窄本身就会让结果变，方向必须能分出来。
+    """
+    check(doctor.universe_shift(["a", "b"], ["a", "b"]) == "", "覆盖没变不该报")
+    check(doctor.universe_shift(["a"], ["a", "b"]) == "grew", "补标的是变宽")
+    check(doctor.universe_shift(["a", "b"], ["a"]) == "shrank", "少标的是变窄")
+    check(doctor.universe_shift(["a", "b"], ["a", "c"]) == "changed", "换标的是换了一批")
+    # 老基线没有 universe 字段：无从比较，不能当成「变窄」乱报警
+    check(doctor.universe_shift(None, ["a"]) == "", "旧基线无记录时不该下结论")
+    check(doctor.universe_shift([], ["a"]) == "", "空覆盖不该下结论")
 
 
 @case("信号诊断：跨午休的持有期不是持有 h 分钟，必须剔除")
