@@ -702,15 +702,21 @@ def t_flow_window():
               "两笔入金被重复计入：%.2f（应≈0）" % sn3["day_pnl"])
 
 
-@case("入金：flows 值坏掉必须报错，不能静默当 0")
+@case("入金：坏值和坏键都必须被认出来，不能静默丢一笔钱")
 def t_flow_bad():
-    """状态混同的反面：解析失败不能返回一个「看着正常」的 0。
+    """状态混同的反面：解析失败不能返回一个「看着正常」的结果。
 
-    若把坏值吞成 0，这笔钱从账本里凭空消失，而 day_pnl 显示正常
-    ——正是「安静地给错结论」。
+    值坏掉若被吞成 0，这笔钱从账本里凭空消失而 day_pnl 显示正常；
+    键写成 '2026-1-6'（不补零）若按字符串比大小，会被判成「晚于今天」丢掉，
+    后果一样 —— 都是「安静地给错结论」。
     """
     with sandbox():
         acc = broker.load_account()
+        acc["cash"] = 10000.0
+        acc["meta"]["init_capital"] = 10000.0
+        acc["today"] = "2026-01-05"
+        broker.snapshot(acc, {}, note="起点", write=True)
+
         acc["cash"] = 100000.0
         acc["meta"]["init_capital"] = 100000.0
         acc["today"] = "2026-01-06"
@@ -721,6 +727,11 @@ def t_flow_bad():
             pass
         else:
             check(False, "flows 值不是数字，却被当成 0 吞掉了")
+
+        acc["flows"] = {"2026-1-6": 90000.0}      # 键不补零
+        sn = broker.snapshot(acc, {}, note="键不补零", write=True)
+        check(abs(sn["day_pnl"]) < 1.0,
+              "flows 键 '2026-1-6' 被当成别的日子丢掉，假盈亏 %.2f" % sn["day_pnl"])
 
 
 @case("组合：权重在偏离带内不动，脱靶才拉回")

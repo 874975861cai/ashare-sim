@@ -513,10 +513,19 @@ def snapshot(acc, quotes, note="", write=True):
             day_start = float(r[1])
             prev_day = r[0]
     flow = 0.0
+    prev_d = datetime.strptime(prev_day, "%Y-%m-%d").date() if prev_day else None
+    today_d = datetime.strptime(today, "%Y-%m-%d").date()
     for k, v in flows.items():
-        if prev_day and k <= prev_day:
+        try:
+            # 必须按日期比，不能拿字符串比大小：'2026-1-06' 这类非补零写法会被
+            # 判成「早于 2026-11-06」而静默丢掉，那笔钱就从账本里消失，
+            # 而 day_pnl 仍然看着正常。
+            kd = datetime.strptime(k, "%Y-%m-%d").date()
+        except (TypeError, ValueError):
+            raise ValueError("flows 的键不是 YYYY-MM-DD：%r" % (k,))
+        if prev_d and kd <= prev_d:
             continue
-        if k > today:
+        if kd > today_d:
             continue
         try:
             flow += float(v or 0.0)
