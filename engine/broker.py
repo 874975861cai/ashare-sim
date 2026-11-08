@@ -496,12 +496,34 @@ def snapshot(acc, quotes, note="", write=True):
     # 入金/出金：2026-11-09 追加 90,170 把资金从 1 万加到 10 万。
     # 不记这一列，「当日盈亏」会把入金算成盈利（当天显示 +90,170），
     # 周报的「最佳/最差日」「日胜率」全部被一条假记录带偏。
+    #
+    # 按**区间**消费，不按「日期精确等于今天」消费（2026-11-08 改）：
+    # 入金日记在哪一天天生要靠估——周末迁移记在下一个工作日、节假日迁移记在
+    # 休市日、收盘后迁移只能记到次日。旧写法 `flows.get(today)` 只要差一天就
+    # 两头都错：当天漏扣（假盈利 N），次日又在**已经含钱**的 day_start 上再扣
+    # 一次（假亏损 N）。实测 +90,000 / -90,000 两条假记录永久写进 equity.csv，
+    # 而且没有任何检查会报——它长着正常数字的样子。
+    # 正确口径与「哪天入金」无关：上一根净值行之后、今天之前到账的钱，都属于
+    # 今天的非交易性变动。同日精确匹配只是这个区间的一个特例。
     flows = acc.get("flows") or {}
-    flow = float(flows.get(today) or 0.0)
     day_start = init
+    prev_day = ""
     for r in rows[1:]:
         if r and r[0] < today:
             day_start = float(r[1])
+            prev_day = r[0]
+    flow = 0.0
+    for k, v in flows.items():
+        if prev_day and k <= prev_day:
+            continue
+        if k > today:
+            continue
+        try:
+            flow += float(v or 0.0)
+        except (TypeError, ValueError):
+            # 不能当 0 吞掉：这笔钱会凭空消失，而 day_pnl 看起来完全正常。
+            raise ValueError("flows[%s] 不是数字：%r" % (k, v))
+    flow = round(flow, 2)
     day_pnl = round(eq - day_start - flow, 2)
     # 历史行只有 7 列，补上 flow=0，否则 csv 列数不齐，DictReader 读出来是 None
     fixed = []

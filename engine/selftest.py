@@ -46,7 +46,7 @@ VERBOSE = False
 CASES = []
 # 用例总数基线（见 main() 里的说明：少了要红，不是"通过 41 项"）。
 # 2026-10-19 建 1 条起算，每加一条用例都要同步改这里。
-EXPECTED_CASES = 53
+EXPECTED_CASES = 55
 
 
 def case(name):
@@ -660,6 +660,67 @@ def t_flow():
               "入金被算成当日盈利：%.2f（应≈0）" % sn["day_pnl"])
         check(abs(sn["total_pnl"]) < 1.0,
               "累计盈亏把入金算进成本：%.2f" % sn["total_pnl"])
+
+
+@case("入金：记在周末/次日都不能产生假盈亏，且只扣一次")
+def t_flow_window():
+    """入金日记在哪一天天生要靠估：周末迁移、收盘后迁移、节假日迁移。
+
+    旧写法只认 `flows[today]`，差一天就两头都错——当天漏扣（假盈利 N），
+    次日又在已经含钱的 day_start 上再扣一次（假亏损 N）。实测 9 万入金
+    留下 +90,000 与 -90,000 两条永久净值行，之后没有任何检查会报。
+    """
+    with sandbox():
+        acc = broker.load_account()
+        acc["cash"] = 10000.0
+        acc["meta"]["init_capital"] = 10000.0
+        acc["today"] = "2026-01-02"                  # 周五
+        broker.snapshot(acc, {}, note="起点", write=True)
+
+        # A 周末入金记在周六，周一才跑
+        acc["cash"] = 100000.0
+        acc["meta"]["init_capital"] = 100000.0
+        acc["flows"] = {"2026-01-03": 90000.0}       # 周六
+        acc["today"] = "2026-01-05"                  # 周一
+        sn = broker.snapshot(acc, {}, note="周末入金", write=True)
+        check(abs(sn["day_pnl"]) < 1.0,
+              "入金记在周六，周一算出假盈亏 %.2f（应≈0）" % sn["day_pnl"])
+
+        # B 同一天重跑（幂等）：不能把同一笔入金再扣一次
+        sn2 = broker.snapshot(acc, {}, note="同日重跑", write=True)
+        check(abs(sn2["day_pnl"] - sn["day_pnl"]) < 0.01,
+              "同日重跑把入金又扣了一次：%.2f -> %.2f"
+              % (sn["day_pnl"], sn2["day_pnl"]))
+
+        # C 第二笔入金记在次日，窗口只该算自己那天，不能带上周六那笔
+        acc["cash"] = 150000.0
+        acc["meta"]["init_capital"] = 150000.0
+        acc["flows"] = {"2026-01-03": 90000.0, "2026-01-06": 50000.0}
+        acc["today"] = "2026-01-06"
+        sn3 = broker.snapshot(acc, {}, note="二次入金", write=True)
+        check(abs(sn3["day_pnl"]) < 1.0,
+              "两笔入金被重复计入：%.2f（应≈0）" % sn3["day_pnl"])
+
+
+@case("入金：flows 值坏掉必须报错，不能静默当 0")
+def t_flow_bad():
+    """状态混同的反面：解析失败不能返回一个「看着正常」的 0。
+
+    若把坏值吞成 0，这笔钱从账本里凭空消失，而 day_pnl 显示正常
+    ——正是「安静地给错结论」。
+    """
+    with sandbox():
+        acc = broker.load_account()
+        acc["cash"] = 100000.0
+        acc["meta"]["init_capital"] = 100000.0
+        acc["today"] = "2026-01-06"
+        acc["flows"] = {"2026-01-06": "9万"}
+        try:
+            broker.snapshot(acc, {}, note="坏入金", write=True)
+        except ValueError:
+            pass
+        else:
+            check(False, "flows 值不是数字，却被当成 0 吞掉了")
 
 
 @case("组合：权重在偏离带内不动，脱靶才拉回")
