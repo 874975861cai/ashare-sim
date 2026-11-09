@@ -39,6 +39,7 @@ import doctor      # noqa: E402
 import market
 import weekly     # noqa: E402      # noqa: E402
 import push_repo   # noqa: E402
+import push_cloud  # noqa: E402
 import runner      # noqa: E402
 import strategy    # noqa: E402
 
@@ -46,7 +47,7 @@ VERBOSE = False
 CASES = []
 # 用例总数基线（见 main() 里的说明：少了要红，不是"通过 41 项"）。
 # 2026-10-19 建 1 条起算，每加一条用例都要同步改这里。
-EXPECTED_CASES = 56
+EXPECTED_CASES = 57
 
 
 def case(name):
@@ -1919,6 +1920,56 @@ def t_review_gate():
                   % (last2, n2))
         finally:
             weekly.REVIEW_FILE = old
+
+
+@case("看板推送：入金不动流水也必须推得出去")
+def t_push_sig_tracks_cash():
+    """2026-11-09 的真实事故：账本入金 90169.60，线上看板还显示现金 54.50。
+
+    旧签名只哈希 trades.csv，入金不改流水 → 签名不变 → push 认为"推过了"，
+    直接跳过。要等到下一次成交才会顺带把现金推上去，期间手机上看到的
+    可买金额是错的（显示 54.50 实际 9 万），而本地一切「检查通过」。
+    """
+    trades = b"1,2026-10-29,...\n"
+    base = {"cash": 54.5, "meta": {"init_capital": 10000.0},
+            "positions": {"510880": {"realized": 0.0, "lots": [
+                {"date": "2026-10-29", "shares": 2900, "price": 3.4}]}},
+            "flows": {}, "today": "2026-11-06", "peak_equity": 10000.0,
+            "trade_seq": 11}
+    sig0 = push_cloud.ledger_fingerprint(trades, base)
+
+    # 1) 入金：流水一个字没变，但现金变了 → 必须换签名
+    dep = json.loads(json.dumps(base))
+    dep["cash"] = 90224.1
+    dep["meta"]["init_capital"] = 100169.6
+    dep["flows"] = {"2026-11-09": 90169.6}
+    check(push_cloud.ledger_fingerprint(trades, dep) != sig0,
+          "入金不改流水时签名没变，看板会永远停在旧现金（本次事故原样复现）")
+
+    # 2) 持仓变动（成交外的分红送股）也要算进去
+    pos = json.loads(json.dumps(base))
+    pos["positions"]["510880"]["lots"][0]["shares"] = 3000
+    check(push_cloud.ledger_fingerprint(trades, pos) != sig0, "持仓股数变了签名没变")
+
+    # 3) 流水变了当然要换
+    check(push_cloud.ledger_fingerprint(trades + b"2,...\n", base) != sig0,
+          "流水变了签名没变")
+
+    # 4) 每日都会动的字段不算：否则等于每 5 分钟推一次
+    vol = json.loads(json.dumps(base))
+    vol["today"] = "2026-11-09"
+    vol["peak_equity"] = 12345.0
+    vol["trade_seq"] = 99
+    check(push_cloud.ledger_fingerprint(trades, vol) == sig0,
+          "today/peak_equity/trade_seq 被算进签名，会每轮都推")
+
+    # 5) 金额微差要能分辨（round 后仍不同）
+    tiny = json.loads(json.dumps(base))
+    tiny["cash"] = 54.51
+    check(push_cloud.ledger_fingerprint(trades, tiny) != sig0, "1 分钱差异被抹平")
+
+    # 6) 空账本不能崩
+    check(bool(push_cloud.ledger_fingerprint(b"", {})), "空账本算不出签名")
 
 
 if __name__ == "__main__":

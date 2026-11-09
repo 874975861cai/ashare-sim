@@ -40,15 +40,67 @@ PUB_FILE = os.path.join(broker.STATE, ".published")
 LOG_FILE = os.path.join(broker.STATE, "push.log")
 
 
-def _sig():
-    """账本签名：只看成交流水。净值表每天都会动，拿它当签名等于每次都推。"""
+def ledger_fingerprint(trades_bytes, acc):
+    """账本指纹：流水 + 「看板必须看到一致」的资金/仓位/入金流。
+
+    2026-11-09 修：旧版只对 trades.csv 取哈希。入金、迁移、分红这类
+    **不动流水**却动了现金的变更，于是永远推不出去——签名没变就跳过，
+    看板一直停在旧现金。当天线上显示 54.50、账本其实已是 90224.10
+    （入金 90169.60），正是这么来的；再等不到成交就一直错下去。
+
+    反过来 today / peak_equity / trade_seq 每轮都在变，算进去等于每 5
+    分钟推一次，所以刻意排除：只认「钱、仓位、入金流」这三类。
+    """
     h = hashlib.sha256()
+    h.update(trades_bytes or b"")
+    h.update(b"\0")
+    acc = acc or {}
+    meta = acc.get("meta") or {}
+    try:
+        init = round(float(meta.get("init_capital") or 0.0), 2)
+        cash = round(float(acc.get("cash") or 0.0), 2)
+    except (TypeError, ValueError):
+        init = cash = 0.0
+    flows = {}
+    for k, v in (acc.get("flows") or {}).items():
+        try:
+            flows[str(k)] = round(float(v or 0.0), 2)
+        except (TypeError, ValueError):
+            flows[str(k)] = str(v)          # 坏值也要参与指纹，别静默丢掉
+    pos = {}
+    for code, p in (acc.get("positions") or {}).items():
+        p = p or {}
+        try:
+            realized = round(float(p.get("realized") or 0.0), 2)
+        except (TypeError, ValueError):
+            realized = 0.0
+        lots = []
+        for lot in (p.get("lots") or []):
+            lot = lot or {}
+            try:
+                lots.append([str(lot.get("date") or ""),
+                             int(lot.get("shares") or 0),
+                             round(float(lot.get("price") or 0.0), 4)])
+            except (TypeError, ValueError):
+                lots.append([str(lot.get("date") or ""), 0, 0.0])
+        pos[str(code)] = {"realized": realized, "lots": lots}
+    norm = {"cash": cash, "init": init, "flows": flows, "pos": pos}
+    h.update(json.dumps(norm, sort_keys=True, ensure_ascii=False).encode("utf-8"))
+    return h.hexdigest()[:16]
+
+
+def _sig():
+    """账本签名：流水 + 现金/仓位/入金流（见 ledger_fingerprint）。"""
     try:
         with open(broker.TRADE_FILE, "rb") as f:
-            h.update(f.read())
+            trades = f.read()
     except OSError:
         return ""
-    return h.hexdigest()[:16]
+    try:
+        acc = broker.load_account()
+    except (OSError, ValueError):
+        acc = {}                            # 读不出来也要能算出一个稳定签名
+    return ledger_fingerprint(trades, acc)
 
 
 def _pub_fp():
