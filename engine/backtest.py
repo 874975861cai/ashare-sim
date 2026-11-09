@@ -5,6 +5,7 @@
   * 第 i 分钟的信号只用 ticks[0..i] 的信息；
   * 成交发生在第 i+1 分钟的价格（下一根分钟 bar 的市价单）。
 """
+import json
 import os
 import sys
 from collections import defaultdict
@@ -16,6 +17,31 @@ import market      # noqa: E402
 import strategy    # noqa: E402
 
 CACHE = {}
+
+ACCOUNT_FILE = os.path.join(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))), "state", "account.json")
+
+
+def live_capital(default=10000.0):
+    """实盘本金（`state/account.json` 的 meta.init_capital）。
+
+    为什么要有它（2026-11-09 自审）：
+    回测的 capital 默认值一直是 10000，而 2026-11-07 账本已迁到 10 万。
+    于是 doctor 的回归探针、weekly 的参数对照、optimize 的排名全都在
+    一个**已经不存在的 1 万账户**上算 —— 单笔 5 元佣金下限相当于
+    1 万本金下的 0.15%，10 万本金下只有 0.015%，同一份行情能差 0.19pp，
+    比整套策略的月度盈亏还大。这些数字每天出现在体检和周报里，
+    却没有任何一处会报错，因为「本金 1 万」本身是个合法输入。
+
+    只读，不创建文件（本地 state/ 是云端账本的只读镜像）；
+    读不到时退回 default，并在调用方留痕（不静默假装成功）。
+    """
+    try:
+        with open(ACCOUNT_FILE, encoding="utf-8") as f:
+            v = float(json.load(f)["meta"]["init_capital"])
+        return v if v > 0 else float(default)
+    except Exception:  # noqa: BLE001
+        return float(default)
 
 
 def load_pool(codes, ndays=5, verbose=True, offline=False, report=None):
@@ -175,7 +201,7 @@ def _day_axis(data, day):
     return sorted(tl), idx
 
 
-def run_mix_backtest(data, params, days, capital=10000.0, verbose=False):
+def run_mix_backtest(data, params, days, capital=None, verbose=False):
     """组合模式（mode="mix"）的分钟级回放：09:35 调仓一次，其余时间持有。
 
     为什么必须单独有一条路径（2026-11-07 补）：
@@ -191,6 +217,7 @@ def run_mix_backtest(data, params, days, capital=10000.0, verbose=False):
         年度尺度的收益与回撤仍由 hiret.py 的日线检验负责；
       · 窗口通常只有 5 个交易日，所以再平衡多半只发生在首日。
     """
+    capital = float(capital) if capital is not None else live_capital()
     cash = float(capital)
     start = cash
     equity = cash
@@ -335,8 +362,11 @@ def run_mix_backtest(data, params, days, capital=10000.0, verbose=False):
             "blocked": blocked, "capital": capital, "mode": "mix"}
 
 
-def run_backtest(data, params, days, capital=10000.0, verbose=False):
+def run_backtest(data, params, days, capital=None, verbose=False):
     """组合回放：单票集中，全池扫描。
+
+    capital=None 表示「按实盘本金」（`live_capital()`）：这个默认值曾经写死
+    10000，账本迁到 10 万后所有回测都悄悄按 1 万算，手续费下限被放大十倍。
 
     与实盘 broker 对齐的四条撮合规则：
       * 滑点：买入 +1 tick / 卖出 -1 tick，与 broker.buy/sell 一致；
@@ -349,6 +379,7 @@ def run_backtest(data, params, days, capital=10000.0, verbose=False):
     strategy.decide 里读 params["max_trades"]），已删除，避免读代码的人
     误以为 R8 在这一层被强制。
     """
+    capital = float(capital) if capital is not None else live_capital()
     cash = capital
     equity_val = capital
     start_equity = capital
@@ -634,15 +665,17 @@ def run_backtest(data, params, days, capital=10000.0, verbose=False):
             "capital": capital, "mode": params.get("mode") or "daytrade"}
 
 
-def metrics(res, capital=10000.0):
+def metrics(res, capital=None):
     """收益口径必须用「这次回放真正用了多少本金」，不能靠调用方记得传。
 
-    本金默认值一直是 10000，而 2026-11-09 账本本金已加到 10 万：
+    本金默认值一直是 10000，而 2026-11-07 账本本金已加到 10 万：
     `run_backtest(capital=100000)` 配上不带参的 `metrics(r)`，
     ret_pct 会静默缩成实际的 1/10 —— 一个整数误差，看着完全正常。
-    所以本金随结果返回，metrics 优先读它。
+    所以本金随结果返回，metrics 优先读它；连结果里都没有时才去读账本
+    （`live_capital()`），最后才退回 1 万。三层顺序不能颠倒：
+    结果里的本金是**这一次真正用掉的**，账本里的只是「如果没指定应该是多少」。
     """
-    capital = float(res.get("capital") or capital)
+    capital = float(res.get("capital") or capital or live_capital())
     sells = [t for t in res["trades"] if t["side"] == "SELL"]
     wins = [t for t in sells if t["pnl"] > 0]
     n = len(sells)

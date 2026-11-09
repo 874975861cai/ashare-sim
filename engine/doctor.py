@@ -1343,8 +1343,15 @@ def check_backtest_baseline():
         # 而它真正的意思是「这一行什么都没量」。口径要存进基线，否则下次换模式
         # 会把「口径变了」报成「代码退化」。
         probe_kind = "mix" if mode == "mix" else "daytrade"
-        m = backtest.metrics(backtest.run_backtest(data, probe_p, days))
-        m_live = backtest.metrics(backtest.run_backtest(data, live_p, days))
+        # 本金口径必须写进基线（2026-11-09 补）：账本 11-07 已从 1 万迁到 10 万，
+        # 而回测默认本金曾是 10000 —— 同一份行情按 1 万算比按 10 万算多 0.19pp
+        # 手续费拖累（5 元佣金下限被放大十倍）。口径变了却不记，
+        # 下次改回默认值时这条闸门会把「本金换了」报成「代码退化」。
+        cap = backtest.live_capital()
+        m = backtest.metrics(backtest.run_backtest(data, probe_p, days,
+                                                  capital=cap))
+        m_live = backtest.metrics(backtest.run_backtest(data, live_p, days,
+                                                       capital=cap))
         ret = round(float(m.get("ret_pct", 0)), 4)
         n = int(m.get("trades", 0))
         sig = _params_sig(live_p)
@@ -1385,6 +1392,7 @@ def check_backtest_baseline():
             json.dump({"ret_pct": ret, "trades": n, "days": days,
                        "universe": universe,
                        "params": sig, "code": _code_sig(), "probe": probe_kind,
+                       "capital": round(cap, 2),
                        "saved": datetime.now().strftime("%Y-%m-%d %H:%M")},
                       f, ensure_ascii=False, indent=2)
 
@@ -1482,6 +1490,24 @@ def check_backtest_baseline():
         add(OK, "回归", "回测基线",
             "回归探针口径变更（%s → %s），已按新口径重设基线 探针 %.2f%% / %d 笔（%s）%s"
             % (base.get("probe") or "未记录", probe_kind, ret, n, live_txt, tail))
+        return
+
+    if round(float(base.get("capital") or 0), 2) != round(cap, 2):
+        # 本金口径变了（老基线固定按 1 万跑，2026-11-07 账本已迁到 10 万）。
+        # ret_pct 当然会变，这不是代码退化；但也不能默默 save()。
+        # 不单独写一条的话，它会落进下面的 drift 分支，被报成
+        # 「同一份数据、参数指纹未变，所以是代码行为变了」——一个假警报。
+        old_cap = base.get("capital")
+        old_txt = ("未记录（旧版固定 1 万）" if not old_cap
+                   else "%.2f" % float(old_cap))
+        save()
+        add(OK, "回归", "回测基线",
+            "回测本金口径变更：%s → %.2f（账本 meta.init_capital）。"
+            "已按新本金重设基线 探针 %.2f%% / %d 笔（旧基线 %.2f%% / %d 笔）%s。"
+            "本金只影响佣金下限与整手取整，不影响策略决策，所以这不是退化；"
+            "但它足以改变收益率量级，必须显式记账"
+            % (old_txt, cap, ret, n, float(base.get("ret_pct", 0)),
+               base.get("trades", 0), tail))
         return
 
     drift = abs(ret - float(base.get("ret_pct", 0)))

@@ -37,6 +37,7 @@ import analyze     # noqa: E402
 import broker      # noqa: E402
 import doctor      # noqa: E402
 import market
+import optimize    # noqa: E402
 import weekly     # noqa: E402      # noqa: E402
 import push_repo   # noqa: E402
 import push_cloud  # noqa: E402
@@ -47,7 +48,7 @@ VERBOSE = False
 CASES = []
 # 用例总数基线（见 main() 里的说明：少了要红，不是"通过 41 项"）。
 # 2026-10-19 建 1 条起算，每加一条用例都要同步改这里。
-EXPECTED_CASES = 57
+EXPECTED_CASES = 59
 
 
 def case(name):
@@ -1970,6 +1971,99 @@ def t_push_sig_tracks_cash():
 
     # 6) 空账本不能崩
     check(bool(push_cloud.ledger_fingerprint(b"", {})), "空账本算不出签名")
+
+
+@case("回测本金：不带参数时必须取账本，不能退回写死的 1 万")
+def t_bt_capital_from_ledger():
+    """账本 2026-11-07 已从 1 万迁到 10 万，而回测的 capital 默认值还是 10000。
+
+    5 元佣金下限在 1 万本金下等于 0.15%，10 万本金下只有 0.015%：
+    同一份行情、同一套参数，按 1 万算比按 10 万算差 0.19pp（实测
+    -0.552% vs -0.362%）。doctor 的回归探针、weekly 的参数对照、
+    optimize 的排名全都跑在这个默认值上，而且没有任何一处会报错 ——
+    「本金 1 万」本身是一个完全合法的输入，所以它只能靠断言守住。
+    """
+    d1 = "2026-11-02"
+    n = len(session_minutes())
+    data = {"513100": {"name": "纳指ETF",
+                       "days": {d1: mk_ticks(d1, flat_prices(n, 1.80))},
+                       "preclose": {d1: 1.80}, "first_day_no_preclose": d1}}
+    p = dict(strategy.PARAMS, mode="mix")
+    old_file = backtest.ACCOUNT_FILE
+    tmp = tempfile.mkdtemp()
+    try:
+        f = os.path.join(tmp, "account.json")
+        with open(f, "w", encoding="utf-8") as fh:
+            json.dump({"meta": {"init_capital": 250000.0}}, fh)
+        backtest.ACCOUNT_FILE = f
+        check(abs(backtest.live_capital() - 250000.0) < 1e-6,
+              "本金没从账本读出来：%s" % backtest.live_capital())
+        r = backtest.run_backtest(data, p, [d1])
+        check(abs(r["capital"] - 250000.0) < 1e-6,
+              "不带 capital 时退回了旧默认值：%r" % r["capital"])
+        # metrics 的三层顺序：结果里的本金 > 调用方传的 > 账本
+        m = backtest.metrics({"final": 255000.0, "trades": [], "day_pnls": []})
+        check(abs(m["ret_pct"] - 2.0) < 1e-6,
+              "metrics 没有回落到账本本金：ret_pct=%.3f%%" % m["ret_pct"])
+        m2 = backtest.metrics({"final": 10200.0, "trades": [], "day_pnls": [],
+                               "capital": 10000.0})
+        check(abs(m2["ret_pct"] - 2.0) < 1e-6,
+              "结果里自带的 capital 没被优先使用：%.3f%%" % m2["ret_pct"])
+        # 显式传入必须压过账本（对照实验要能指定本金）
+        r2 = backtest.run_backtest(data, p, [d1], capital=10000.0)
+        check(abs(r2["capital"] - 10000.0) < 1e-6,
+              "显式 capital 被账本覆盖了：%r" % r2["capital"])
+        # 账本读不到时不能崩，退回 1 万并且是可解释的默认值
+        backtest.ACCOUNT_FILE = os.path.join(tmp, "missing.json")
+        check(backtest.live_capital() == 10000.0, "账本缺失时没有退回默认值")
+    finally:
+        backtest.ACCOUNT_FILE = old_file
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@case("优化器：改了没用的维度不进网格，0 笔不参与排名")
+def t_optimize_inert_dims():
+    """optimize 的网格五个维度在 mix 模式下**一个都不被读取**。
+
+    2026-11-09 实测：108 组组合跑出来全是 -0.552% / 3 笔，脚本照旧打印
+    「Top 10 参数组」，读者按第一行去改 dev_enter 就是改了个空气。
+    这条用例同时钉住正向能力：真的会变的维度不能被误剔。
+    """
+    d1, d2 = "2026-11-02", "2026-11-03"
+    n = len(session_minutes())
+
+    def mk(c, p1, p2):
+        return {"name": c,
+                "days": {d1: mk_ticks(d1, flat_prices(n, p1)),
+                         d2: mk_ticks(d2, flat_prices(n, p2))},
+                "preclose": {d1: p1, d2: p1}, "first_day_no_preclose": d1}
+
+    # 513100 第二天翻倍：这才能让「再平衡周期」真的产生差别（平盘时
+    # 权重不漂移，调不调仓的结果一样，反而会把有效维度误判成无效）
+    data = {"513100": mk("513100", 1.80, 3.60), "518880": mk("518880", 3.60, 3.60),
+            "159915": mk("159915", 2.40, 2.40)}
+    p = dict(strategy.PARAMS, mode="mix", mix_rebal_days=244)
+
+    # 1) mix 下日内参数无效：必须被判成 inert
+    inert, ref = optimize.probe_dims(data, [d1, d2], p,
+                                     {"dev_enter": [0.0070, 0.0080, 0.0090]},
+                                     capital=100000.0)
+    check(inert == ["dev_enter"],
+          "mix 下 dev_enter 不生效却没被剔除：%s" % inert)
+    check(ref["fills"] >= 3, "探针自己没建仓，这条断言证明不了什么")
+
+    # 2) 真的会被读取的维度不能被误剔（正向对照）
+    inert2, ref2 = optimize.probe_dims(data, [d1, d2], p,
+                                       {"mix_rebal_days": [1, 244]},
+                                       capital=100000.0)
+    check(inert2 == [], "mix_rebal_days 明明改变成交，却被判成无效：%s" % inert2)
+
+    # 3) 0 笔 0.00% 不能压过亏钱的 6 笔（旧代码就是这么排的）
+    rows = [(0.0, 0, 0.0, {}, {}), (-1.0, 6, 50.0, {}, {})]
+    rows.sort(key=lambda x: (-x[0], -x[1]))
+    keep = optimize.rank_rows(rows)
+    check(len(keep) == 1 and keep[0][1] == 6,
+          "0 笔的组合混进了排名：%s" % [(r[0], r[1]) for r in keep])
 
 
 if __name__ == "__main__":
