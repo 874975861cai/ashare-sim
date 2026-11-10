@@ -34,7 +34,13 @@ journal/
 
 # 备份目录
 state/backup_*/
-state/_backup_*/
+# 备份/隔离出来的单文件（stash 前的手工备份、doctor 隔离的损坏样本）。
+# 注意上面的 `_backup_*/` 只匹配目录，文件名形式的备份会漏进版本库 ——
+# 而云端 workflow 是 `git add -A state`，漏一次就等于把坏文件提交上去。
+state/_backup_*
+state/_corrupt_*
+# 原子写的临时残骸：进程在 os.replace 之前被杀会留下 .tmp
+state/*.tmp
 
 # Python
 __pycache__/

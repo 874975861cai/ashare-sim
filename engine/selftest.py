@@ -48,7 +48,7 @@ VERBOSE = False
 CASES = []
 # 用例总数基线（见 main() 里的说明：少了要红，不是"通过 41 项"）。
 # 2026-10-19 建 1 条起算，每加一条用例都要同步改这里。
-EXPECTED_CASES = 59
+EXPECTED_CASES = 62
 
 
 def case(name):
@@ -2064,6 +2064,110 @@ def t_optimize_inert_dims():
     keep = optimize.rank_rows(rows)
     check(len(keep) == 1 and keep[0][1] == 6,
           "0 笔的组合混进了排名：%s" % [(r[0], r[1]) for r in keep])
+
+
+@case("看板推送：没有成交的日子，净值曲线也必须跟上")
+def t_push_sig_tracks_settled_equity():
+    """签名漏了净值表 → 不成交就永远不推。
+
+    现金/仓位/流水全都没变，但 equity.csv 每天收盘照样多一行。mix 模式
+    可以连着几周不调仓，于是手机上的净值曲线停在上一笔成交那天，而本地
+    每一条检查都是绿的（推送「没变化」，确实没变化）。
+    反向的约束同样重要：今天那一行每 5 分钟就被重写，算进去等于每轮都推。
+    """
+    hdr = "\ufeffdate,equity,cash,market_value,day_pnl,total_pnl,note,flow\n"
+    d2, d1 = days_before(2), days_before(1)
+    acc = {"cash": 753.09, "meta": {"init_capital": 100169.6},
+           "positions": {}, "flows": {}, "today": d1}
+    trades = b"1,x\n"
+    eq = hdr + "%s,99990.00,753.09,99236.91,-10.00,-10.00,收盘存档,0\n" % d2
+    sig0 = push_cloud.ledger_fingerprint(trades, acc, eq)
+    check(sig0 == push_cloud.ledger_fingerprint(trades, acc, eq),
+          "同一份内容两次算出不同签名")
+
+    # 1) 新增一行「已结算」净值（昨天收盘、今天没成交）→ 必须换签名
+    eq_settled = eq + "%s,100010.09,753.09,99257.00,20.09,20.09,收盘存档,0\n" % d1
+    check(push_cloud.ledger_fingerprint(trades, acc, eq_settled) != sig0,
+          "新增了已结算的净值行，签名没变 → 曲线会一直停更")
+
+    # 2) 只改今天那行（盘中每 5 分钟都在改）→ 不能换签名
+    t = today()
+    eq_today = eq + "%s,100020.00,753.09,99266.91,30.00,30.00,盘中运行,0\n" % t
+    check(push_cloud.ledger_fingerprint(trades, acc, eq_today) == sig0,
+          "今天那一行被算进签名，会每 5 分钟推一次")
+
+    # 3) 已结算行的权益被改写（例如补齐当天收盘价）→ 必须换签名
+    eq_fix = eq.replace("99990.00", "99995.00", 1)
+    check(push_cloud.ledger_fingerprint(trades, acc, eq_fix) != sig0,
+          "已结算行的数字变了，没成交就不推，曲线会一直是错的")
+
+    # 4) 缺净值表（None）不能崩，也不能和「有表但空」混成同一件事之外的样子
+    check(bool(push_cloud.ledger_fingerprint(trades, acc)),
+          "不传净值表时算不出签名")
+
+
+@case("看板推送：零成交的账户不是「账本读不出来」")
+def t_push_empty_ledger_not_error():
+    """全新账户（有现金、一条流水都没有）必须能推出去。
+
+    旧 `_sig()` 把「trades.csv 不存在」和「读不出来」都返回空串，
+    调用方一律报「账本读不出来」——于是新账户的看板永远停在 0，
+    而日志里那句「读不出来」看起来像是文件坏了，没人会去查它其实是正常的。
+    """
+    with sandbox() as tmp:
+        old = broker.TRADE_FILE
+        try:
+            broker.TRADE_FILE = os.path.join(tmp, "完全没有这个文件.csv")
+            data, err = push_cloud._read_trades_bytes()
+            check(data == b"" and err == "",
+                  "一条成交都没有被当成读不出来：%r / %r" % (data, err))
+            sig, err = push_cloud._sig(data, "")
+            check(bool(sig) and not err,
+                  "零成交的账户算不出签名：%r / %r" % (sig, err))
+        finally:
+            broker.TRADE_FILE = old
+
+        # 反面：账户文件坏了必须报「账本读不出来」，不能拿空账户的指纹顶替
+        with open(broker.ACCOUNT_FILE, "w", encoding="utf-8") as f:
+            f.write("{坏掉的 JSON")
+        sig, err = push_cloud._sig(b"", "")
+        check(sig == "" and "账本读不出来" in err,
+              "账户损坏时给出了签名（会写进 .pushed，下一轮误判成已推过）：%r" % sig)
+
+
+@case("回归基线：文件损坏不能报成「首次建立基线」")
+def t_baseline_corrupt():
+    """2026-11-10 真实事故：state/baseline.json 变成 489 个 NUL 字节。
+
+    旧代码 `_read_json` 把「文件不在」和「读坏了」都返回 None，
+    于是损坏的基线被报成「首次建立基线」——绿色，而且顺手把旧基线覆盖掉。
+    真正的代码退化就这么被一行 OK 盖过去，连证据都不剩。
+    """
+    with sandbox() as tmp:
+        p = os.path.join(tmp, "baseline.json")
+        check(doctor._read_json_state(p) == ("missing", None),
+              "文件不在时应报 missing")
+        with open(p, "wb") as f:
+            f.write(b"\0" * 64)
+        check(doctor._read_json_state(p)[0] == "corrupt",
+              "全零文件被当成了「不存在」")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write('["不是对象"]')
+        check(doctor._read_json_state(p)[0] == "corrupt",
+              "顶层不是对象的 JSON 没被判坏")
+
+        # 写：损坏时能重建；内容没变时不重写（saved 时间戳不该把工作区弄脏）
+        check(doctor._save_baseline(p, {"ret_pct": 1.0}) == "written",
+              "损坏文件没能重建")
+        before = open(p, "r", encoding="utf-8").read()
+        check(doctor._read_json_state(p)[0] == "ok", "重建后的文件读不出来")
+        check(doctor._save_baseline(p, {"ret_pct": 1.0}) == "unchanged",
+              "内容没变还重写了一遍（每跑一次 doctor 就脏一次工作区）")
+        check(open(p, "r", encoding="utf-8").read() == before,
+              "内容没变却改写了文件")
+        check(doctor._save_baseline(p, {"ret_pct": 2.0}) == "written",
+              "结果变了却没重设基线")
+        check(not os.path.exists(p + ".tmp"), "原子写留下了 .tmp 残骸")
 
 
 if __name__ == "__main__":

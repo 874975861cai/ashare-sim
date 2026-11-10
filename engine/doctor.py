@@ -70,6 +70,58 @@ def _read_json(p, default=None):
         return default
 
 
+def _read_json_state(p):
+    """读 JSON，并把「没有」和「读不出来」分开：("missing"/"corrupt"/"ok", 值)。
+
+    _read_json 两种都返回 None，调用方于是把「首次」当成「没坏」。
+    账本类文件混了这两种还有 CRIT 兜着（"不存在或损坏"）；基线文件混起来更糟：
+    一个写坏的基线会被报成「首次建立基线」——绿的。真正的代码退化就这么
+    被一行 OK 盖过去了，而且顺手把旧基线覆盖掉，连证据都不剩。
+    """
+    if not os.path.exists(p):
+        return "missing", None
+    try:
+        with open(p, "r", encoding="utf-8-sig") as f:   # 容忍 BOM
+            val = json.load(f)
+    except Exception:  # noqa: BLE001
+        return "corrupt", None
+    if not isinstance(val, dict):
+        return "corrupt", None
+    return "ok", val
+
+
+def _save_baseline(path, payload):
+    """写回归基线，返回 "written" / "unchanged" / "error:<原因>"。
+
+    两条要求都是被事故逼出来的：
+
+    1) **原子写**（临时文件 + os.replace）。2026-11-10 早上 state/baseline.json
+       变成了 489 个 NUL 字节：直接 open(w) 覆盖目标文件，进程在写盘中途被杀
+       或者机器异常掉电，NTFS 会留下一个「大小对、内容全零」的文件。
+       最坏情况应该是「这轮没写进去」，而不是「写坏」。
+
+    2) **内容没变就不写**。saved 时间戳每轮都不同，旧写法每跑一次 doctor 就把
+       工作区弄脏一次：一天三次巡检都得先 stash 再 pop，而 stash 正要搬动这个
+       正在被改写的文件。少写一次就少一次踩雷的机会。
+    """
+    st, old = _read_json_state(path)
+    if st == "ok" and {k: v for k, v in old.items() if k != "saved"} == payload:
+        return "unchanged"
+    rec = dict(payload)
+    rec["saved"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+    try:
+        broker._atomic_write_text(
+            path, json.dumps(rec, ensure_ascii=False, indent=2))
+    except OSError as e:
+        # 写不进去必须喊：调用方接下来都会打印「已按…重设基线」，
+        # 而实际上什么都没记住 —— 下一轮仍拿旧基线比，
+        # 那时的「一致/漂移」是在和一个已经不存在的基准对话。
+        add(WARN, "回归", "回测基线",
+            "基线写入失败（%s）：本轮结果没有被记住，下一轮仍旧拿旧基线比" % e)
+        return "error:%s" % e
+    return "written"
+
+
 def _read_trades():
     p = broker.TRADE_FILE
     if not os.path.exists(p):
@@ -1388,19 +1440,34 @@ def check_backtest_baseline():
                      % int(m_live["open_n"]))
 
     def save():
-        with open(base_f, "w", encoding="utf-8") as f:
-            json.dump({"ret_pct": ret, "trades": n, "days": days,
-                       "universe": universe,
-                       "params": sig, "code": _code_sig(), "probe": probe_kind,
-                       "capital": round(cap, 2),
-                       "saved": datetime.now().strftime("%Y-%m-%d %H:%M")},
-                      f, ensure_ascii=False, indent=2)
+        return _save_baseline(base_f, {
+            "ret_pct": ret, "trades": n, "days": days,
+            "universe": universe,
+            "params": sig, "code": _code_sig(), "probe": probe_kind,
+            "capital": round(cap, 2)})
 
-    base = _read_json(base_f)
-    if not base:
+    bstate, base = _read_json_state(base_f)
+    if bstate == "missing":
         save()
         add(OK, "回归", "回测基线",
             "首次建立基线 探针 %.2f%% / %d 笔（%s）%s" % (ret, n, live_txt, tail))
+        return
+    if bstate == "corrupt":
+        # 损坏 ≠ 首次。绝不能默默 save() 后报「首次建立基线」：那等于把
+        # 「这一轮什么都没比」说成绿，并且顺手毁掉旧基线。先把坏文件挪走留证。
+        quarantine = ""
+        try:
+            q = os.path.join(STATE, "_corrupt_baseline_%s.json"
+                             % datetime.now().strftime("%Y%m%d_%H%M%S"))
+            os.replace(base_f, q)
+            quarantine = "；原文件已隔离为 state/%s" % os.path.basename(q)
+        except OSError as e:
+            quarantine = "；原文件隔离失败（%s）" % e
+        save()
+        add(WARN, "回归", "回测基线",
+            "基线文件损坏（不是合法 JSON 或内容为空），本轮**无法比对**："
+            "已按当前结果重建基线 探针 %.2f%% / %d 笔（%s），本次与历史是否有"
+            "差异归因不了%s%s" % (ret, n, live_txt, quarantine, tail))
         return
 
     # 交易日没变、但标的覆盖变了：这是「数据换了」，不是「代码变了」。
