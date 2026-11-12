@@ -28,7 +28,7 @@ import os
 import shutil
 import sys
 import tempfile
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stdout
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -38,6 +38,7 @@ import broker      # noqa: E402
 import doctor      # noqa: E402
 import market
 import optimize    # noqa: E402
+import riskstudy   # noqa: E402
 import weekly     # noqa: E402      # noqa: E402
 import push_repo   # noqa: E402
 import push_cloud  # noqa: E402
@@ -48,7 +49,7 @@ VERBOSE = False
 CASES = []
 # 用例总数基线（见 main() 里的说明：少了要红，不是"通过 41 项"）。
 # 2026-10-19 建 1 条起算，每加一条用例都要同步改这里。
-EXPECTED_CASES = 62
+EXPECTED_CASES = 66
 
 
 def case(name):
@@ -2168,6 +2169,140 @@ def t_baseline_corrupt():
         check(doctor._save_baseline(p, {"ret_pct": 2.0}) == "written",
               "结果变了却没重设基线")
         check(not os.path.exists(p + ".tmp"), "原子写留下了 .tmp 残骸")
+
+
+@case("风险体检：回撤分位的「10% 概率更深」必须真的比中位深")
+def t_risk_dd_quantile():
+    """2026-11-12：riskstudy 的 Q4 把 90/99 分位当「悲观档」印在中位右边。
+
+    回撤是负数、mdds 升序排列，所以 pct(mdds,.9) 落在浅的那一头。
+    实跑输出「中位 -10.66% / 90%分位 -6.27% / 99%分位 -4.20%」——
+    每个数字都对，但读者会以为「90% 概率回撤不超过 -6%」，正好反了。
+    这里把方向钉死：深尾的阈值必须比中位更深（更负）。
+    """
+    mdds = sorted([-0.35, -0.20, -0.12, -0.10, -0.08, -0.05, -0.03, -0.02,
+                   -0.01, 0.0])
+    med = riskstudy.quantile(mdds, 0.5)
+    deep10 = riskstudy.quantile(mdds, 0.1)
+    deep01 = riskstudy.quantile(mdds, 0.01)
+    check(deep10 < med, "10%% 档 %r 没有比中位 %r 更深（分位方向又反了）"
+          % (deep10, med))
+    check(deep01 <= deep10, "1%% 档 %r 没有比 10%% 档 %r 更深" % (deep01, deep10))
+    check(deep01 == mdds[0], "1% 档应就是最深那一个")
+    # 旧的错法：pct(mdds,.9) 比中位浅，正是要拦的那个
+    check(riskstudy.quantile(mdds, 0.9) > med,
+          "升序序列的 90% 分位不该比中位更负（若相等说明样本构造有问题）")
+    check(riskstudy.quantile([], 0.5) is None, "空序列应返回 None 而不是抛错")
+    check(riskstudy.quantile([1.0, 2.0], 2.0) == 2.0, "p 越界要夹到 1.0")
+
+
+@case("风险体检：过期缓存不能当成新数据，也不许静默重取失败")
+def t_risk_stale_cache():
+    """2026-11-12：10 只标的的日线缓存全停在 10-27，报告一个字没提。
+
+    riskstudy 的缓存文件名里只有「代码+年数」，`refresh` 参数从来没有
+    从命令行传进来过（死参数），于是这份缓存可以一直用到天荒地老。
+    实测后果不只是「旧 16 天」：Q3 的结论从「红利超出随机期望 +2.46pp」
+    直接翻成「-6.06pp」，符号都变了。
+    """
+    today_s = datetime.now().strftime("%Y-%m-%d")
+    fresh = [{"date": today_s, "close": 1.0}]
+    old = [{"date": "2026-10-27", "close": 1.0}]
+    check(riskstudy.is_stale(fresh) is False, "今天的数据被判成过期")
+    check(riskstudy.stale_days(fresh) == 0, "今天的数据天数不是 0")
+    check(riskstudy.is_stale(old), "16 天前的数据没被判成过期")
+    check(riskstudy.is_stale([]) is True, "空序列应当算不可用（过期）")
+    check(riskstudy.stale_days([{"close": 1.0}]) is None, "缺 date 应返回 None")
+
+    # 新鲜缓存：直接命中，不该打接口（打接口在这里必然超时/失败）
+    tmp = tempfile.mkdtemp(prefix="tsim_risk_")
+    old_cache = riskstudy.CACHE
+    try:
+        riskstudy.CACHE = tmp
+        p = os.path.join(tmp, "risk_510880_3y_hfq.json")
+        riskstudy._write_json_atomic(p, {"bars": fresh, "code": "510880"})
+        bars, src = riskstudy.load_bars("510880", years=3)
+        check(src == "cache", "新鲜缓存却没走缓存分支：%r" % src)
+        check(bars == fresh, "缓存内容被改了")
+        check(not os.path.exists(p + ".tmp"), "原子写留下了 .tmp 残骸")
+    finally:
+        riskstudy.CACHE = old_cache
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # 参数写错不能被当成默认 10 年跑下去
+    check(riskstudy.parse_args(["x", "--years", "5", "--refresh"]) == (5, True),
+          "--years/--refresh 没被正确解析")
+    for bad in (["x", "--years", "abc"], ["x", "--years"], ["x", "--years", "0"],
+                ["x", "--yars", "5"]):
+        try:
+            riskstudy.parse_args(bad)
+        except ValueError:
+            continue
+        raise AssertionError("非法参数 %r 被静默接受了" % (bad,))
+
+
+@case("风险体检：一只都没取到数据不能报成功")
+def t_risk_no_data():
+    """旧 main() 在 10 只全失败时照常打印空表、退出码 0。
+
+    一份「什么都没算」的报告看起来和「算完了没发现异常」一模一样，
+    定时任务/人都会以为今天体检过了。同理，510880 缺数据时 Q2/Q3/Q4
+    （本文件的全部目的）会被整段跳过，也不能报 0。
+    """
+    real = riskstudy.load_bars
+    n = 300
+    zigzag = [{"date": "2026-%02d-%02d" % (i // 28 + 1, i % 28 + 1),
+               "close": 1.0 + 0.02 * ((i * 7) % 11)} for i in range(n)]
+
+    def boom(code, years=10, refresh=False):
+        raise RuntimeError("模拟接口失败")
+
+    def no_hong(code, years=10, refresh=False):
+        return ([], "cache") if code == "510880" else (zigzag, "cache")
+
+    try:
+        with open(os.devnull, "w") as dn, redirect_stdout(dn):
+            riskstudy.load_bars = boom
+            code1 = riskstudy.main(["x", "--years", "3"])
+            riskstudy.load_bars = no_hong
+            code2 = riskstudy.main(["x", "--years", "3"])
+    finally:
+        riskstudy.load_bars = real
+    check(code1 == 1, "全失败时应返回 1，实际 %r" % code1)
+    check(code2 == 1, "510880 缺数据（Q2-Q4 全跳过）时应返回 1，实际 %r" % code2)
+
+
+@case("风险体检：区间不同或数据报脏的标的不能进夏普排名")
+def t_risk_rankable():
+    """2026-11-12：Q1 的「夏普排名」把 6 年数据和 10 年数据排在一起。
+
+    588000（科创50）2020-11 才有数据，实测被排出 -1.09% 垫底，
+    而它少掉的 2016-2019 恰好是震荡期；排名是这张表唯一的结论性输出，
+    混区间就等于用不同的尺子量身高。脏数据（拆分没处理）同理：
+    年化波动会被算到 60%+，谁进榜谁第一。
+    """
+    def row(code, sharpe, start, span="2016-01~2026-11"):
+        return (code, 0.05, 0.2, sharpe, -0.2, 0.2, span, start)
+
+    rows = [row("510880", 0.27, "2016-01-04"),
+            row("510050", 0.13, "2016-01-04"),
+            row("512100", 0.21, "2016-11-04"),
+            row("588000", -0.08, "2020-11-16")]
+    ok = [r[0] for r in riskstudy.rankable(rows)]
+    check(ok == ["510880", "510050"],
+          "不同起始区间的标的进了排名：%r" % (ok,))
+    ok2 = [r[0] for r in riskstudy.rankable(rows, dirty=("510050",))]
+    check(ok2 == ["510880"], "体检报脏的标的仍在排名里：%r" % (ok2,))
+    check(riskstudy.rankable([], ()) == [], "空表应返回空表")
+
+    # sanity 必须真能认出拆分跳空（它是 rankable 的前置闸门）
+    split = [{"date": "2022-08-31", "close": 0.982},
+             {"date": "2022-09-01", "close": 1.05},
+             {"date": "2022-09-05", "close": 2.713}]
+    check(riskstudy.sanity(split, "512100") is False, "1 拆 N 的跳空没被认出来")
+    check(riskstudy.sanity([{"date": "2026-11-10", "close": 1.0},
+                            {"date": "2026-11-11", "close": 1.02}]) is True,
+          "正常序列被误判成脏数据")
 
 
 if __name__ == "__main__":
