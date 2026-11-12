@@ -23,6 +23,7 @@
 退出码：0 = 全过，1 = 有失败。
 """
 import hashlib
+import io
 import json
 import os
 import shutil
@@ -39,6 +40,7 @@ import doctor      # noqa: E402
 import market
 import optimize    # noqa: E402
 import riskstudy   # noqa: E402
+import rule_search  # noqa: E402
 import weekly     # noqa: E402      # noqa: E402
 import push_repo   # noqa: E402
 import push_cloud  # noqa: E402
@@ -49,7 +51,7 @@ VERBOSE = False
 CASES = []
 # 用例总数基线（见 main() 里的说明：少了要红，不是"通过 41 项"）。
 # 2026-10-19 建 1 条起算，每加一条用例都要同步改这里。
-EXPECTED_CASES = 66
+EXPECTED_CASES = 70
 
 
 def case(name):
@@ -2303,6 +2305,117 @@ def t_risk_rankable():
     check(riskstudy.sanity([{"date": "2026-11-10", "close": 1.0},
                             {"date": "2026-11-11", "close": 1.02}]) is True,
           "正常序列被误判成脏数据")
+
+
+@case("规则搜索：窗口内无数据 ≠ 规则未触发")
+def t_rule_nodata_window():
+    """report 里「窗口一根K线都没有」和「规则评估过、没出信号」必须分开印。
+
+    旧版 backtest 两种都返回 []，stat([])→None、line() 一律印「0 笔（规则未触发）」。
+    缓存一旦停在样本外开始日之前，整段样本外会伪装成「规则被检验过、没触发」。
+    """
+    bars = [{"date": "2024-01-%02d" % d, "open": 10.0, "close": 10.0,
+             "high": 10.0, "low": 10.0} for d in range(1, 6)]
+    sig = [0] * len(bars)
+    nd = rule_search.backtest(bars, sig, "2030-01-01", "2031-01-01")
+    zr = rule_search.backtest(bars, sig, "2023-01-01", "2025-01-01")
+    check(nd is rule_search.NO_DATA, "窗口内无 K 线必须返回 NO_DATA，实际 %r" % (nd,))
+    check(zr == [], "有数据但规则没触发必须返回空列表，实际 %r" % (zr,))
+    check(rule_search.stat(nd) is rule_search.NO_DATA, "stat 吞掉了 NO_DATA 哨兵")
+    s_nd = rule_search.line("X 外", rule_search.stat(nd))
+    s_zr = rule_search.line("X 内", rule_search.stat(zr))
+    check("未评估" in s_nd and "规则未触发" not in s_nd,
+          "无数据窗口被印成了规则结论：%s" % s_nd)
+    check("规则未触发" in s_zr and "未评估" not in s_zr,
+          "有数据未触发被印成了无数据：%s" % s_zr)
+    # T 日信号→T+1 开盘成交，可成交根数只数 bars[1:]
+    check(rule_search.window_cover(bars, "2023-01-01", "2025-01-01") == 4,
+          "window_cover 把信号日算成了成交日")
+
+
+@case("规则搜索：新鲜度未知不等于过期，一根坏K线不拖垮全池")
+def t_rule_load_states():
+    """stale_days() 返回 None 是「读不出日期」，不是「过期 12 天以上」。
+
+    旧版把 None 塞进 stale，下游印成「过期缓存：510300 None 天前」。
+    另外 sanity() 在 try 外调用，一只标的的一根坏K线会把整轮报告带崩。
+    """
+    real = (riskstudy.load_bars, riskstudy.sanity, riskstudy.stale_days,
+            rule_search.POOL)
+
+    def bars_for(code):
+        out = [{"date": "2026-%02d-%02d" % (i // 28 + 1, i % 28 + 1),
+                "open": 1.0, "close": 1.0, "high": 1.0, "low": 1.0}
+               for i in range(80)]
+        if code == "BAD":
+            out[3]["close"] = 0.0   # 下一根的 1.0/0.0 会抛 ZeroDivisionError
+        return out
+
+    try:
+        rule_search.POOL = ("AAA", "BAD")
+        riskstudy.load_bars = lambda c, years=10, refresh=False: (bars_for(c), "cache")
+        riskstudy.sanity = real[1]
+        riskstudy.stale_days = lambda b: None
+        with redirect_stdout(io.StringIO()):
+            data, health = rule_search.load()
+    finally:
+        (riskstudy.load_bars, riskstudy.sanity, riskstudy.stale_days,
+         rule_search.POOL) = real
+    check("AAA" in data, "正常标的应保留在 data 里")
+    check("BAD" not in data, "坏K线标的应跳过，而不是让整轮崩溃")
+    check(any(c == "BAD" and "体检失败" in w for c, w in health["missing"]),
+          "坏K线没被明确记为缺失原因：%r" % (health["missing"],))
+    check("AAA" in health["unknown"], "日期读不出应进 unknown：%r" % health)
+    check(health["stale"] == [], "「未知」被当成了「过期」：%r" % (health["stale"],))
+
+
+@case("规则搜索：数据截至用最新终点，未知天数不印成「None 天前」")
+def t_rule_report_health():
+    """终点不一致时，『数据截至』必须是最新日期。
+
+    旧版取 sorted(ends)[0]（最旧），却在同段把 sorted(ends)[-1] 称作「最新」，
+    一只标的落后就让整份报告被标成 N 天前。
+    """
+    data = {c: [{"date": "2026-11-11", "open": 1.0, "close": 1.0,
+                 "high": 1.0, "low": 1.0}] for c in ("A", "B")}
+    health = {"missing": [], "stale": [("B", None)], "unknown": [],
+              "src": {"A": "cache", "B": "cache"},
+              "ends": {"A": "2026-10-27", "B": "2026-11-11"}}
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        ok = rule_search.report_health(data, health)
+    out = buf.getvalue()
+    check(ok is True, "有数据时应判可用")
+    check("数据截至 2026-11-11" in out, "『数据截至』用了最旧终点：%s" % out)
+    check("最旧 2026-10-27" in out, "没把最旧终点单独说明：%s" % out)
+    check("数据截至 2026-10-27" not in out, "整份报告被最旧标的绑架了")
+    check("None 天前" not in out, "未知天数印成了 None：%s" % out)
+    check("新鲜度未知" in out, "未知新鲜度没有独立播报：%s" % out)
+
+    # 全都读不出终点日期：不能报「可用」
+    health2 = dict(health, ends={"A": "", "B": ""}, stale=[])
+    buf2 = io.StringIO()
+    with redirect_stdout(buf2):
+        ok2 = rule_search.report_health(data, health2)
+    check(ok2 is False, "一根终点日期都读不出却返回可用")
+
+
+@case("规则搜索：一只都没取到数据时退出码不能是 0")
+def t_rule_no_data_exit():
+    """全失败时报告必须返回 1。『什么都没算』和『算完没异常』不能同形。"""
+    real = (riskstudy.load_bars, rule_search.POOL)
+
+    def boom(code, years=10, refresh=False):
+        raise RuntimeError("模拟接口全挂")
+
+    try:
+        rule_search.POOL = ("AAA", "BBB")
+        riskstudy.load_bars = boom
+        with redirect_stdout(io.StringIO()):
+            code = rule_search.main([])
+    finally:
+        riskstudy.load_bars, rule_search.POOL = real
+    check(code == 1, "全失败时应返回 1，实际 %r" % code)
 
 
 if __name__ == "__main__":
