@@ -43,6 +43,9 @@ REPO = "874975861cai/ashare-sim"
 API = "https://api.github.com"
 TOKEN_FILES = [
     os.path.join(BASE, "state", ".gh_token"),
+    # 第二条是历史路径：E:\TradingSim_cloud 那份已停用的云端副本已于
+    # 2026-11-14 删除（里面的 .gh_token 已先搬到 state/.gh_token）。
+    # 留着这条只为兼容「别处还放着一个工作副本」的机器，删掉也没关系。
     r"E:\TradingSim_cloud\state\.gh_token",
 ]
 

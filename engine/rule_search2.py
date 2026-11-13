@@ -21,39 +21,36 @@
      （单标的只能「跟着自己的均线走」，横截面能「换到还在涨的品种」）。
 
 同时测一个保守对照：红利底仓 + 长均线风控。
+
+数据口径（2026-11-14 迁移，本节是同族里最后一个改过来的）
+----------------------------------------------------------
+旧版读 `state/cache/daykline_3y.json` —— **前复权**序列、不过期、2026-10-28 之后
+再没更新过，报告只印「日线 923 根」，读者无从判断这是哪套价格。
+rule_search.py 已于 11-12 换成 `riskstudy.load_bars`（腾讯后复权），本文件一直
+挂着这个债：它恰恰要回答「横截面择时 vs 买入持有」，而前复权把高分红标的的
+买入持有系统性高估约 19pp（510880 实测 +46.04% vs 后复权 +27.25%）——
+等于用一份把对手方吹高的数据来比谁更强。现在两族同池同口径，
+`dual_momentum` 的横截面也才真的同尺可比。
 """
 
-import json
 import os
+import sys
 
-BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-# ⚠️ 已知技术债（待人工确认，不要默默当正确）：这里读的是
-# state/cache/daykline_3y.json，一份**前复权**序列（等差口径），最后更新于
-# 2026-10-28，既旧又有口径偏差——高分红标的（如 510880）的买入持有收益会被
-# 系统性高估约 19pp（详见 riskstudy.load_bars 的注释）。同族的 rule_search.py
-# 已于 2026-11-12 改用 riskstudy.load_bars（后复权 + 缓存/过期判定）。本文件应
-# 同步迁移；迁移会改变全部结论，需用户拍板，故暂未动。
-CACHE = os.path.join(BASE, "state", "cache", "daykline_3y.json")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import rule_search  # noqa: E402  加载器/体检播报/参数解析都复用它
 
+# 10 只横截面池：与旧 daykline_3y.json 的成员完全一致，只换复权口径。
+POOL = ("510300", "510330", "510500", "510050", "510880",
+        "159901", "159915", "159919", "512100", "588000")
+YEARS = 10            # 十年后复权缓存，覆盖 2023-01 起的全部分析窗口
 COST = 0.0018
 IS = ("2023-01-01", "2025-06-30")
 OOS = ("2025-07-01", "2026-12-31")
 
 
-def load():
-    with open(CACHE, "r", encoding="utf-8") as f:
-        raw = json.load(f)
-    data = {}
-    for c, kl in raw.items():
-        bars = []
-        for line in kl:
-            p = line.split(",")
-            if len(p) < 5:
-                continue
-            bars.append({"date": p[0], "open": float(p[1]), "close": float(p[2]),
-                         "high": float(p[3]), "low": float(p[4])})
-        data[c] = bars
-    return data
+def load(refresh=False):
+    """取后复权日线。返回 (data, health)，口径与 rule_search 完全一致。"""
+    return rule_search.load_pool(POOL, refresh=refresh)
 
 
 # 「窗口内一根可成交 K 线都没有」的哨兵。不能与 [] / None 混用：那两者经过
@@ -174,8 +171,19 @@ def red_with_guard(data, code, n, rebal=5):
     return rets
 
 
-def main():
-    data = load()
+def main(argv=None):
+    try:
+        refresh = rule_search.parse_args(sys.argv[1:] if argv is None else argv)
+    except ValueError as e:
+        print(str(e))
+        return 2
+
+    print("加载后复权日线（%d 年，%s）…"
+          % (YEARS, "强制刷新" if refresh else "优先用缓存"))
+    data, health = load(refresh)
+    if not rule_search.report_health(data, health, pool_size=len(POOL)):
+        return 1
+
     dates_all = [b["date"] for b in data[sorted(data)[0]]]
     print("日线 %d 根 %s ~ %s，标的 %d 只\n"
           % (len(dates_all), dates_all[0], dates_all[-1], len(data)))

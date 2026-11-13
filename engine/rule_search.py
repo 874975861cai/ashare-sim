@@ -67,7 +67,17 @@ POOL = tuple(sorted(set(POOL_A) | set(POOL_BCD)))
 
 # ---------------------------------------------------------------- 数据
 def load(refresh=False):
-    """取后复权日线。返回 (data, health)。
+    """取后复权日线（本文件的标的池）。返回 (data, health)。"""
+    return load_pool(POOL, refresh=refresh)
+
+
+def load_pool(pool, refresh=False):
+    """取后复权日线，可指定标的池。返回 (data, health)。
+
+    **为什么要拆出 pool 参数**（2026-11-14）：rule_search2.py 用的是 10 只的
+    横截面池，原来各自读 state/cache/daykline_3y.json（前复权、不过期）。
+    迁移时若再抄一份加载逻辑，哪天加载口径改了必然只改一处 —— 于是把
+    「怎么取数/怎么体检/怎么判过期」收敛到这里，两个脚本只差一个池子。
 
     **为什么返回第二项**：旧版本遇到缺标的直接 KeyError（或让空列表流进
     max()/min()），遇到短序列静默给出 0 笔——「没数据」和「规则没触发」
@@ -75,7 +85,7 @@ def load(refresh=False):
     """
     data, health = {}, {"missing": [], "stale": [], "unknown": [], "dirty": [],
                        "src": {}, "ends": {}}
-    for c in POOL:
+    for c in pool:
         try:
             bars, src = riskstudy.load_bars(c, years=YEARS, refresh=refresh)
         except Exception as e:  # noqa: BLE001
@@ -315,8 +325,13 @@ def parse_args(argv):
     return refresh
 
 
-def report_health(data, health):
-    """数据体检播报。返回 True = 数据可用。"""
+def report_health(data, health, pool_size=None):
+    """数据体检播报。返回 True = 数据可用。
+
+    pool_size：复用本函数时的池子大小（rule_search2 的池是 10 只）。
+    默认取本文件的 POOL，别再让「10 只里只有 5 只可用」被印成「5/5 只」。
+    """
+    pool_size = len(POOL) if pool_size is None else pool_size
     # 允许调用方只带部分桶（自测/复用时常见）。缺桶 = 该类问题没有，
     # 不是「数据正常」的兜底：真正的数据在 data 里，这里只补齐播报用的键。
     for k, v in (("missing", []), ("stale", []), ("unknown", []),
@@ -345,7 +360,7 @@ def report_health(data, health):
     for s in health["src"].values():
         srcs[s] = srcs.get(s, 0) + 1
     print("数据：后复权（腾讯）｜%d/%d 只｜数据截至 %s（%s）｜最旧 %s｜来源 %s"
-          % (len(data), len(POOL), asof,
+          % (len(data), pool_size, asof,
              "未知" if age is None else "%d 天前" % age, oldest,
              " / ".join("%s %d" % (k, v) for k, v in sorted(srcs.items()))))
 

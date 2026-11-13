@@ -32,9 +32,17 @@ URL = (os.environ.get("SIM_CLOUD_URL")
        or "https://ashare-sim-dashboard.app.workbuddy.link").rstrip("/")
 TOKEN = os.environ.get("SIM_SYNC_TOKEN") or "sim-sync-9f3a7c"
 # ⚠️ 上面这个兜底 token 写在公开仓库里，等于一把人人可用的钥匙：谁都能拿它
+# 往看板写账本。2026-11-14 复核结论（别再重复排查）：
+#   · 用本地 token 查 `/repos/.../actions/secrets` 返回 []，即仓库**一个 Secret
+#     都没有** → 云端每一轮都走这个兜底值，不是「配好了只是没用上」。
+#   · 接收端（POST /api/sync）不在本仓库：engine/serve.py 只有 GET（/api/state、
+#     /api/ping），真正收数据的那个版本在已停用的发布通道里。所以「换一把新
+#     token」需要同时改接收端 —— 现在改不了，单改这一行只会让看板停更。
+#   · 能做的只有把它说清楚：下一轮若 Secret 仍是空的，日志里会一直有那条
+#     「使用硬编码兜底 token」的告警，那是**事实**，不是噪音，别关掉。
+#   · 留了这份账，是为了将来能安全轮换时一步改两处，而不是又从头查一遍。
 # POST /api/sync 覆盖线上账本。保留它只是为了「secret 没配时不至于当场停服」，
 # 但从现在起每次走到兜底都要留痕，否则连「线上账本被谁写的」都查不出来。
-# 真正的修法是轮换 Worker 侧与 GitHub secret 里的同一把 token，那一步要人来定。
 _ENV_TOKEN = os.environ.get("SIM_SYNC_TOKEN") or ""
 
 SIG_FILE = os.path.join(broker.STATE, ".pushed")

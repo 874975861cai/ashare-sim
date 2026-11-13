@@ -1,0 +1,1204 @@
+{
+  "updated": "2026-11-14",
+  "source": "tdx_screener 沪深300成分股 (3页×100, 已去重)",
+  "count": 299,
+  "duplicates_removed": 1,
+  "stocks": [
+    {
+      "code": "301236",
+      "setcode": 0
+    },
+    {
+      "code": "000596",
+      "setcode": 0
+    },
+    {
+      "code": "300251",
+      "setcode": 0
+    },
+    {
+      "code": "600845",
+      "setcode": 1
+    },
+    {
+      "code": "000568",
+      "setcode": 0
+    },
+    {
+      "code": "600066",
+      "setcode": 1
+    },
+    {
+      "code": "600809",
+      "setcode": 1
+    },
+    {
+      "code": "002027",
+      "setcode": 0
+    },
+    {
+      "code": "601857",
+      "setcode": 1
+    },
+    {
+      "code": "000333",
+      "setcode": 0
+    },
+    {
+      "code": "600941",
+      "setcode": 1
+    },
+    {
+      "code": "002714",
+      "setcode": 0
+    },
+    {
+      "code": "000651",
+      "setcode": 0
+    },
+    {
+      "code": "300442",
+      "setcode": 0
+    },
+    {
+      "code": "601766",
+      "setcode": 1
+    },
+    {
+      "code": "601225",
+      "setcode": 1
+    },
+    {
+      "code": "002311",
+      "setcode": 0
+    },
+    {
+      "code": "601169",
+      "setcode": 1
+    },
+    {
+      "code": "300832",
+      "setcode": 0
+    },
+    {
+      "code": "603369",
+      "setcode": 1
+    },
+    {
+      "code": "600887",
+      "setcode": 1
+    },
+    {
+      "code": "000001",
+      "setcode": 0
+    },
+    {
+      "code": "000100",
+      "setcode": 0
+    },
+    {
+      "code": "600919",
+      "setcode": 1
+    },
+    {
+      "code": "300498",
+      "setcode": 0
+    },
+    {
+      "code": "300015",
+      "setcode": 0
+    },
+    {
+      "code": "601825",
+      "setcode": 1
+    },
+    {
+      "code": "600690",
+      "setcode": 1
+    },
+    {
+      "code": "600019",
+      "setcode": 1
+    },
+    {
+      "code": "600028",
+      "setcode": 1
+    },
+    {
+      "code": "601088",
+      "setcode": 1
+    },
+    {
+      "code": "600415",
+      "setcode": 1
+    },
+    {
+      "code": "600011",
+      "setcode": 1
+    },
+    {
+      "code": "001965",
+      "setcode": 0
+    },
+    {
+      "code": "600795",
+      "setcode": 1
+    },
+    {
+      "code": "600938",
+      "setcode": 1
+    },
+    {
+      "code": "301269",
+      "setcode": 0
+    },
+    {
+      "code": "601988",
+      "setcode": 1
+    },
+    {
+      "code": "601009",
+      "setcode": 1
+    },
+    {
+      "code": "601628",
+      "setcode": 1
+    },
+    {
+      "code": "601818",
+      "setcode": 1
+    },
+    {
+      "code": "601601",
+      "setcode": 1
+    },
+    {
+      "code": "600000",
+      "setcode": 1
+    },
+    {
+      "code": "601398",
+      "setcode": 1
+    },
+    {
+      "code": "600660",
+      "setcode": 1
+    },
+    {
+      "code": "600674",
+      "setcode": 1
+    },
+    {
+      "code": "600519",
+      "setcode": 1
+    },
+    {
+      "code": "600027",
+      "setcode": 1
+    },
+    {
+      "code": "603019",
+      "setcode": 1
+    },
+    {
+      "code": "600009",
+      "setcode": 1
+    },
+    {
+      "code": "688271",
+      "setcode": 1
+    },
+    {
+      "code": "002415",
+      "setcode": 0
+    },
+    {
+      "code": "002352",
+      "setcode": 0
+    },
+    {
+      "code": "601998",
+      "setcode": 1
+    },
+    {
+      "code": "000999",
+      "setcode": 0
+    },
+    {
+      "code": "002142",
+      "setcode": 0
+    },
+    {
+      "code": "600803",
+      "setcode": 1
+    },
+    {
+      "code": "301165",
+      "setcode": 0
+    },
+    {
+      "code": "601328",
+      "setcode": 1
+    },
+    {
+      "code": "601077",
+      "setcode": 1
+    },
+    {
+      "code": "601838",
+      "setcode": 1
+    },
+    {
+      "code": "601288",
+      "setcode": 1
+    },
+    {
+      "code": "600926",
+      "setcode": 1
+    },
+    {
+      "code": "600600",
+      "setcode": 1
+    },
+    {
+      "code": "000895",
+      "setcode": 0
+    },
+    {
+      "code": "601018",
+      "setcode": 1
+    },
+    {
+      "code": "600018",
+      "setcode": 1
+    },
+    {
+      "code": "601816",
+      "setcode": 1
+    },
+    {
+      "code": "603501",
+      "setcode": 1
+    },
+    {
+      "code": "601166",
+      "setcode": 1
+    },
+    {
+      "code": "600930",
+      "setcode": 1
+    },
+    {
+      "code": "601658",
+      "setcode": 1
+    },
+    {
+      "code": "002236",
+      "setcode": 0
+    },
+    {
+      "code": "300760",
+      "setcode": 0
+    },
+    {
+      "code": "000708",
+      "setcode": 0
+    },
+    {
+      "code": "000858",
+      "setcode": 0
+    },
+    {
+      "code": "000538",
+      "setcode": 0
+    },
+    {
+      "code": "600025",
+      "setcode": 1
+    },
+    {
+      "code": "601916",
+      "setcode": 1
+    },
+    {
+      "code": "600900",
+      "setcode": 1
+    },
+    {
+      "code": "600050",
+      "setcode": 1
+    },
+    {
+      "code": "688047",
+      "setcode": 1
+    },
+    {
+      "code": "600015",
+      "setcode": 1
+    },
+    {
+      "code": "601728",
+      "setcode": 1
+    },
+    {
+      "code": "601919",
+      "setcode": 1
+    },
+    {
+      "code": "601318",
+      "setcode": 1
+    },
+    {
+      "code": "600016",
+      "setcode": 1
+    },
+    {
+      "code": "600188",
+      "setcode": 1
+    },
+    {
+      "code": "601939",
+      "setcode": 1
+    },
+    {
+      "code": "601006",
+      "setcode": 1
+    },
+    {
+      "code": "300866",
+      "setcode": 0
+    },
+    {
+      "code": "300628",
+      "setcode": 0
+    },
+    {
+      "code": "601336",
+      "setcode": 1
+    },
+    {
+      "code": "002050",
+      "setcode": 0
+    },
+    {
+      "code": "600023",
+      "setcode": 1
+    },
+    {
+      "code": "600036",
+      "setcode": 1
+    },
+    {
+      "code": "600741",
+      "setcode": 1
+    },
+    {
+      "code": "600061",
+      "setcode": 1
+    },
+    {
+      "code": "601668",
+      "setcode": 1
+    },
+    {
+      "code": "002648",
+      "setcode": 0
+    },
+    {
+      "code": "300124",
+      "setcode": 0
+    },
+    {
+      "code": "601066",
+      "setcode": 1
+    },
+    {
+      "code": "601985",
+      "setcode": 1
+    },
+    {
+      "code": "603288",
+      "setcode": 1
+    },
+    {
+      "code": "688256",
+      "setcode": 1
+    },
+    {
+      "code": "601319",
+      "setcode": 1
+    },
+    {
+      "code": "601888",
+      "setcode": 1
+    },
+    {
+      "code": "601211",
+      "setcode": 1
+    },
+    {
+      "code": "601229",
+      "setcode": 1
+    },
+    {
+      "code": "688041",
+      "setcode": 1
+    },
+    {
+      "code": "688009",
+      "setcode": 1
+    },
+    {
+      "code": "600436",
+      "setcode": 1
+    },
+    {
+      "code": "600406",
+      "setcode": 1
+    },
+    {
+      "code": "300059",
+      "setcode": 0
+    },
+    {
+      "code": "600886",
+      "setcode": 1
+    },
+    {
+      "code": "600276",
+      "setcode": 1
+    },
+    {
+      "code": "600031",
+      "setcode": 1
+    },
+    {
+      "code": "002179",
+      "setcode": 0
+    },
+    {
+      "code": "601898",
+      "setcode": 1
+    },
+    {
+      "code": "000792",
+      "setcode": 0
+    },
+    {
+      "code": "600570",
+      "setcode": 1
+    },
+    {
+      "code": "000063",
+      "setcode": 0
+    },
+    {
+      "code": "603296",
+      "setcode": 1
+    },
+    {
+      "code": "600585",
+      "setcode": 1
+    },
+    {
+      "code": "002920",
+      "setcode": 0
+    },
+    {
+      "code": "601100",
+      "setcode": 1
+    },
+    {
+      "code": "601901",
+      "setcode": 1
+    },
+    {
+      "code": "601058",
+      "setcode": 1
+    },
+    {
+      "code": "300122",
+      "setcode": 0
+    },
+    {
+      "code": "600104",
+      "setcode": 1
+    },
+    {
+      "code": "600918",
+      "setcode": 1
+    },
+    {
+      "code": "002736",
+      "setcode": 0
+    },
+    {
+      "code": "002304",
+      "setcode": 0
+    },
+    {
+      "code": "601788",
+      "setcode": 1
+    },
+    {
+      "code": "600989",
+      "setcode": 1
+    },
+    {
+      "code": "600039",
+      "setcode": 1
+    },
+    {
+      "code": "601111",
+      "setcode": 1
+    },
+    {
+      "code": "605499",
+      "setcode": 1
+    },
+    {
+      "code": "688111",
+      "setcode": 1
+    },
+    {
+      "code": "601669",
+      "setcode": 1
+    },
+    {
+      "code": "601878",
+      "setcode": 1
+    },
+    {
+      "code": "601390",
+      "setcode": 1
+    },
+    {
+      "code": "000166",
+      "setcode": 0
+    },
+    {
+      "code": "600150",
+      "setcode": 1
+    },
+    {
+      "code": "302132",
+      "setcode": 0
+    },
+    {
+      "code": "000625",
+      "setcode": 0
+    },
+    {
+      "code": "000617",
+      "setcode": 0
+    },
+    {
+      "code": "000938",
+      "setcode": 0
+    },
+    {
+      "code": "600030",
+      "setcode": 1
+    },
+    {
+      "code": "600588",
+      "setcode": 1
+    },
+    {
+      "code": "601881",
+      "setcode": 1
+    },
+    {
+      "code": "601688",
+      "setcode": 1
+    },
+    {
+      "code": "600999",
+      "setcode": 1
+    },
+    {
+      "code": "600029",
+      "setcode": 1
+    },
+    {
+      "code": "300033",
+      "setcode": 0
+    },
+    {
+      "code": "002594",
+      "setcode": 0
+    },
+    {
+      "code": "601127",
+      "setcode": 1
+    },
+    {
+      "code": "002294",
+      "setcode": 0
+    },
+    {
+      "code": "002600",
+      "setcode": 0
+    },
+    {
+      "code": "002230",
+      "setcode": 0
+    },
+    {
+      "code": "300896",
+      "setcode": 0
+    },
+    {
+      "code": "600760",
+      "setcode": 1
+    },
+    {
+      "code": "600346",
+      "setcode": 1
+    },
+    {
+      "code": "601689",
+      "setcode": 1
+    },
+    {
+      "code": "601117",
+      "setcode": 1
+    },
+    {
+      "code": "601377",
+      "setcode": 1
+    },
+    {
+      "code": "601456",
+      "setcode": 1
+    },
+    {
+      "code": "600233",
+      "setcode": 1
+    },
+    {
+      "code": "601238",
+      "setcode": 1
+    },
+    {
+      "code": "000776",
+      "setcode": 0
+    },
+    {
+      "code": "001979",
+      "setcode": 0
+    },
+    {
+      "code": "601012",
+      "setcode": 1
+    },
+    {
+      "code": "600372",
+      "setcode": 1
+    },
+    {
+      "code": "300999",
+      "setcode": 0
+    },
+    {
+      "code": "600089",
+      "setcode": 1
+    },
+    {
+      "code": "601995",
+      "setcode": 1
+    },
+    {
+      "code": "601360",
+      "setcode": 1
+    },
+    {
+      "code": "601607",
+      "setcode": 1
+    },
+    {
+      "code": "600085",
+      "setcode": 1
+    },
+    {
+      "code": "601136",
+      "setcode": 1
+    },
+    {
+      "code": "600515",
+      "setcode": 1
+    },
+    {
+      "code": "601618",
+      "setcode": 1
+    },
+    {
+      "code": "601021",
+      "setcode": 1
+    },
+    {
+      "code": "601727",
+      "setcode": 1
+    },
+    {
+      "code": "600115",
+      "setcode": 1
+    },
+    {
+      "code": "600958",
+      "setcode": 1
+    },
+    {
+      "code": "000157",
+      "setcode": 0
+    },
+    {
+      "code": "601186",
+      "setcode": 1
+    },
+    {
+      "code": "002001",
+      "setcode": 0
+    },
+    {
+      "code": "688126",
+      "setcode": 1
+    },
+    {
+      "code": "601868",
+      "setcode": 1
+    },
+    {
+      "code": "600905",
+      "setcode": 1
+    },
+    {
+      "code": "300750",
+      "setcode": 0
+    },
+    {
+      "code": "300274",
+      "setcode": 0
+    },
+    {
+      "code": "600111",
+      "setcode": 1
+    },
+    {
+      "code": "601877",
+      "setcode": 1
+    },
+    {
+      "code": "600010",
+      "setcode": 1
+    },
+    {
+      "code": "001391",
+      "setcode": 0
+    },
+    {
+      "code": "688036",
+      "setcode": 1
+    },
+    {
+      "code": "002371",
+      "setcode": 0
+    },
+    {
+      "code": "688506",
+      "setcode": 1
+    },
+    {
+      "code": "002493",
+      "setcode": 0
+    },
+    {
+      "code": "000408",
+      "setcode": 0
+    },
+    {
+      "code": "688981",
+      "setcode": 1
+    },
+    {
+      "code": "000301",
+      "setcode": 0
+    },
+    {
+      "code": "603799",
+      "setcode": 1
+    },
+    {
+      "code": "300803",
+      "setcode": 0
+    },
+    {
+      "code": "000807",
+      "setcode": 0
+    },
+    {
+      "code": "688082",
+      "setcode": 1
+    },
+    {
+      "code": "000963",
+      "setcode": 0
+    },
+    {
+      "code": "600219",
+      "setcode": 1
+    },
+    {
+      "code": "600309",
+      "setcode": 1
+    },
+    {
+      "code": "000425",
+      "setcode": 0
+    },
+    {
+      "code": "600196",
+      "setcode": 1
+    },
+    {
+      "code": "601600",
+      "setcode": 1
+    },
+    {
+      "code": "603893",
+      "setcode": 1
+    },
+    {
+      "code": "002049",
+      "setcode": 0
+    },
+    {
+      "code": "601899",
+      "setcode": 1
+    },
+    {
+      "code": "002475",
+      "setcode": 0
+    },
+    {
+      "code": "605117",
+      "setcode": 1
+    },
+    {
+      "code": "002466",
+      "setcode": 0
+    },
+    {
+      "code": "000768",
+      "setcode": 0
+    },
+    {
+      "code": "601633",
+      "setcode": 1
+    },
+    {
+      "code": "002422",
+      "setcode": 0
+    },
+    {
+      "code": "002532",
+      "setcode": 0
+    },
+    {
+      "code": "300418",
+      "setcode": 0
+    },
+    {
+      "code": "002241",
+      "setcode": 0
+    },
+    {
+      "code": "300433",
+      "setcode": 0
+    },
+    {
+      "code": "000975",
+      "setcode": 0
+    },
+    {
+      "code": "601800",
+      "setcode": 1
+    },
+    {
+      "code": "601698",
+      "setcode": 1
+    },
+    {
+      "code": "600547",
+      "setcode": 1
+    },
+    {
+      "code": "002602",
+      "setcode": 0
+    },
+    {
+      "code": "601872",
+      "setcode": 1
+    },
+    {
+      "code": "688396",
+      "setcode": 1
+    },
+    {
+      "code": "600893",
+      "setcode": 1
+    },
+    {
+      "code": "002460",
+      "setcode": 0
+    },
+    {
+      "code": "600875",
+      "setcode": 1
+    },
+    {
+      "code": "600426",
+      "setcode": 1
+    },
+    {
+      "code": "002709",
+      "setcode": 0
+    },
+    {
+      "code": "600026",
+      "setcode": 1
+    },
+    {
+      "code": "600160",
+      "setcode": 1
+    },
+    {
+      "code": "600489",
+      "setcode": 1
+    },
+    {
+      "code": "002625",
+      "setcode": 0
+    },
+    {
+      "code": "002202",
+      "setcode": 0
+    },
+    {
+      "code": "600048",
+      "setcode": 1
+    },
+    {
+      "code": "300014",
+      "setcode": 0
+    },
+    {
+      "code": "688223",
+      "setcode": 1
+    },
+    {
+      "code": "000725",
+      "setcode": 0
+    },
+    {
+      "code": "002074",
+      "setcode": 0
+    },
+    {
+      "code": "600221",
+      "setcode": 1
+    },
+    {
+      "code": "000002",
+      "setcode": 0
+    },
+    {
+      "code": "600118",
+      "setcode": 1
+    },
+    {
+      "code": "688012",
+      "setcode": 1
+    },
+    {
+      "code": "600460",
+      "setcode": 1
+    },
+    {
+      "code": "002028",
+      "setcode": 0
+    },
+    {
+      "code": "603259",
+      "setcode": 1
+    },
+    {
+      "code": "300450",
+      "setcode": 0
+    },
+    {
+      "code": "603260",
+      "setcode": 1
+    },
+    {
+      "code": "603392",
+      "setcode": 1
+    },
+    {
+      "code": "002558",
+      "setcode": 0
+    },
+    {
+      "code": "688303",
+      "setcode": 1
+    },
+    {
+      "code": "000630",
+      "setcode": 0
+    },
+    {
+      "code": "600362",
+      "setcode": 1
+    },
+    {
+      "code": "001280",
+      "setcode": 0
+    },
+    {
+      "code": "600438",
+      "setcode": 1
+    },
+    {
+      "code": "600584",
+      "setcode": 1
+    },
+    {
+      "code": "688472",
+      "setcode": 1
+    },
+    {
+      "code": "600482",
+      "setcode": 1
+    },
+    {
+      "code": "000977",
+      "setcode": 0
+    },
+    {
+      "code": "603993",
+      "setcode": 1
+    },
+    {
+      "code": "600522",
+      "setcode": 1
+    },
+    {
+      "code": "688072",
+      "setcode": 1
+    },
+    {
+      "code": "000988",
+      "setcode": 0
+    },
+    {
+      "code": "300316",
+      "setcode": 0
+    },
+    {
+      "code": "688521",
+      "setcode": 1
+    },
+    {
+      "code": "301308",
+      "setcode": 0
+    },
+    {
+      "code": "600549",
+      "setcode": 1
+    },
+    {
+      "code": "300413",
+      "setcode": 0
+    },
+    {
+      "code": "603986",
+      "setcode": 1
+    },
+    {
+      "code": "688183",
+      "setcode": 1
+    },
+    {
+      "code": "000338",
+      "setcode": 0
+    },
+    {
+      "code": "000657",
+      "setcode": 0
+    },
+    {
+      "code": "002837",
+      "setcode": 0
+    },
+    {
+      "code": "600176",
+      "setcode": 1
+    },
+    {
+      "code": "688008",
+      "setcode": 1
+    },
+    {
+      "code": "601138",
+      "setcode": 1
+    },
+    {
+      "code": "300308",
+      "setcode": 0
+    },
+    {
+      "code": "002938",
+      "setcode": 0
+    },
+    {
+      "code": "300661",
+      "setcode": 0
+    },
+    {
+      "code": "300502",
+      "setcode": 0
+    },
+    {
+      "code": "300408",
+      "setcode": 0
+    },
+    {
+      "code": "002353",
+      "setcode": 0
+    },
+    {
+      "code": "002384",
+      "setcode": 0
+    },
+    {
+      "code": "600183",
+      "setcode": 1
+    },
+    {
+      "code": "002916",
+      "setcode": 0
+    },
+    {
+      "code": "002463",
+      "setcode": 0
+    },
+    {
+      "code": "300476",
+      "setcode": 0
+    },
+    {
+      "code": "300394",
+      "setcode": 0
+    }
+  ]
+}

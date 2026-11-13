@@ -52,7 +52,7 @@ VERBOSE = False
 CASES = []
 # 用例总数基线（见 main() 里的说明：少了要红，不是"通过 41 项"）。
 # 2026-10-19 建 1 条起算，每加一条用例都要同步改这里。
-EXPECTED_CASES = 75
+EXPECTED_CASES = 76
 
 
 def case(name):
@@ -2640,6 +2640,33 @@ def t_mixed_day_ticks():
     check("丢弃" in buf.getvalue(), "混入别的交易日却没有留痕：%s" % buf.getvalue()[-300:])
     bad = [r for r in rows if yday in r]
     check(not bad, "流水里出现了昨天的成交时刻：%s" % bad)
+
+
+@case("云端 --check：只判该不该跑，绝不执行、绝不改账本")
+def t_cloud_check_no_exec():
+    """2026-11-14 加。
+
+    `--check` 返回 0 表示「该跑」，普通模式返回 0 表示「已执行」——同一个 0
+    两种意思，文档原来只写了后者。语义分不开的代价是有人拿 `--check` 当
+    「跑一遍看看」，结果真的没跑却以为跑过了（或反过来）。这里钉死两件事：
+    该跑=0 / 不该跑=2，且无论哪种都**不许**碰 runner.run()。
+    """
+    import cloud_run
+    old_run, old_win = runner.run, cloud_run.in_window
+    calls = []
+    try:
+        runner.run = lambda **k: calls.append(k)
+        cloud_run.in_window = lambda now=None: (True, "10:00")
+        with redirect_stdout(io.StringIO()):
+            code_should = cloud_run.main(["--check"])
+        cloud_run.in_window = lambda now=None: (False, "周末")
+        with redirect_stdout(io.StringIO()):
+            code_not = cloud_run.main(["--check"])
+    finally:
+        runner.run, cloud_run.in_window = old_run, old_win
+    check(code_should == 0, "窗口内 --check 应返回 0（该跑），实际 %s" % code_should)
+    check(code_not == 2, "窗口外 --check 应返回 2（不该跑），实际 %s" % code_not)
+    check(not calls, "--check 竟然调用了 runner.run()：%r" % calls)
 
 
 if __name__ == "__main__":
