@@ -124,6 +124,13 @@ jobs:
             echo "::notice title=无标的过门槛::有报价但成交额/价格未达标（早盘常见），本轮跳过"
             exit 0
           fi
+          # 退出码 7 = 当日开盘快照损坏，拒绝重放。账本状态不可信，这一条
+          # **不吞**：它不是「下一轮会自愈」的抖动（3/4 才是那种），重试一百次
+          # 也不会自己好，必须让人看见。刻意不给 exit 0，让 job 变红。
+          if [ "$code" -eq 7 ]; then
+            echo "::error title=开盘快照损坏::state/account_open.json 读不出来，今日拒绝重放。从 git 恢复该文件，或确认当日无成交后手工删除。"
+            exit "$code"
+          fi
           exit "$code"
 
       - name: 账本入库存档

@@ -52,7 +52,7 @@ VERBOSE = False
 CASES = []
 # 用例总数基线（见 main() 里的说明：少了要红，不是"通过 41 项"）。
 # 2026-10-19 建 1 条起算，每加一条用例都要同步改这里。
-EXPECTED_CASES = 71
+EXPECTED_CASES = 75
 
 
 def case(name):
@@ -1565,11 +1565,16 @@ def t_cloud_strategy_changed_code():
         code_stale = cloud_run.main([])
         runner.LAST_SKIP = "not_trading_day"
         code_holiday = cloud_run.main([])
+        # 2026-11-14：快照损坏是账本问题，不是行情问题，必须有自己的码
+        runner.LAST_SKIP = "open_snapshot_corrupt"
+        code_corrupt = cloud_run.main([])
     finally:
         runner.run, runner.LAST_SKIP, cloud_run.in_window = old_run, old_skip, old_win
     check(code_changed == 5, "策略变更加护栏应返回 5，实际 %s" % code_changed)
     check(code_stale == 3, "旧缓存应算数据故障 3，实际 %s" % code_stale)
     check(code_holiday == 2, "非交易日应仍是 2，实际 %s" % code_holiday)
+    check(code_corrupt == 7, "快照损坏应返回 7（不是行情故障 3），实际 %s"
+          % code_corrupt)
 
 
 @case("同步脚本：缺文件不能报「一致」，写入默认被锁")
@@ -2443,6 +2448,198 @@ def t_rule2_nodata():
           "无数据被印成规则结论：%s" % s_nd)
     check("规则未触发" in s_zr and "未评估" not in s_zr,
           "有数据未触发被印成无数据：%s" % s_zr)
+
+
+@case("开盘快照：读坏了不许当成「首次运行」重建")
+def t_open_snapshot_corrupt():
+    """2026-11-14 发现的状态混同。
+
+    旧 reset_to_open 用 `if os.path.exists` + `json.load` 一把抓：
+      · 文件不在 → 「首次运行」，用当前账户重建快照
+      · 文件读坏 → JSONDecodeError 穿透到退出码 1，看起来像代码 bug
+    真正的危险在于「存在但读到 None」被当成「不存在」的写法变体：
+    用**已含今日成交**的账户重建开盘状态，随后 _drop_today_trades 又把
+    今日流水删掉 → 账户有仓位、流水没有；次日重放 = 双份仓位，
+    而现金与流水仍然自洽，doctor 查不出来。
+
+    这里钉死三件事：拒绝执行（返回 None）、原因是专用原因、账本与坏文件
+    都原样不动（尤其不能把坏文件覆盖成「新的开盘快照」）。
+    """
+    day = today()
+    n = len(session_minutes())
+    px = flat_prices(n, 4.0, -0.01)
+    ticks = mk_ticks(day, px)
+    q = {"510300": mk_quote("510300", px[-1])}
+
+    for junk, label in ((b"\x00" * 489, "489 个 NUL 字节"),
+                        (b"", "0 字节"),
+                        (b'{"date": "%s", "accou' % day.encode(), "半截 JSON"),
+                        (b'{"date": "x"}', "缺 account 对象")):
+        with sandbox():
+            acc = broker.load_account()
+            seed_position(acc, "510300", 1000, 4.0, days_before(1))
+            cash_before = acc["cash"]
+            with open(runner.OPEN_FILE, "wb") as f:
+                f.write(junk)
+            before = open(runner.OPEN_FILE, "rb").read()
+            rows_before = (open(broker.TRADE_FILE, encoding="utf-8-sig").read()
+                           if os.path.exists(broker.TRADE_FILE) else "")
+            old = install_fake_market(
+                {"510300": {"ticks": ticks, "preclose": 4.0,
+                            "name": "沪深300ETF"}}, q)
+            try:
+                res = runner.run(verbose=False, execute=True)
+                reason = runner.LAST_SKIP
+            finally:
+                restore_market(old)
+            check(res is None, "快照损坏(%s)仍然执行了重放" % label)
+            check(reason == "open_snapshot_corrupt",
+                  "快照损坏(%s)的原因应为 open_snapshot_corrupt，实际 %r"
+                  % (label, reason))
+            check(open(runner.OPEN_FILE, "rb").read() == before,
+                  "快照损坏(%s)被覆盖了：坏文件必须原样保留当证据" % label)
+            check(broker.load_account()["cash"] == cash_before,
+                  "快照损坏(%s)时仍然改了账户" % label)
+            rows_after = (open(broker.TRADE_FILE, encoding="utf-8-sig").read()
+                          if os.path.exists(broker.TRADE_FILE) else "")
+            check(rows_after == rows_before,
+                  "快照损坏(%s)时仍然改写了流水" % label)
+
+    # 反向：正常快照不能被这条护栏误伤（同一路径必须还能跑通）
+    with sandbox():
+        broker.load_account()
+        old = install_fake_market(
+            {"510300": {"ticks": ticks, "preclose": 4.0, "name": "沪深300ETF"}}, q)
+        try:
+            res = runner.run(verbose=False, execute=True)
+        finally:
+            restore_market(old)
+        check(res is not None and runner.LAST_SKIP == "",
+              "正常快照被误判成损坏：%r" % runner.LAST_SKIP)
+
+
+@case("当日流水：没有今日成交时不重写，有今日成交时原子剔除")
+def t_drop_today_trades():
+    """2026-11-14 发现。
+
+    _drop_today_trades 每轮都整表重写 trades.csv（云端一天 ~50 次），
+    而且用的是 open("w") 非原子写——被 timeout/concurrency 取消在写一半，
+    账本唯一的历史就永久停在被截断的位置。broker 早就因为同样的事改成
+    _atomic_write_text，这个函数漏了。
+
+    两条断言：①没有今日行时一个字节都不动（连空操作都不该冒险）；
+    ②有今日行时只删今日、保留历史，且不留 .tmp。
+    """
+    day = today()
+    header = "seq,time,code,name,side,price,shares,amount,fee,pnl,reason\n"
+    old_row = ("1,%s 10:00,510300,沪深300ETF,BUY,4.000,1000,4000.00,5.00,0,"
+               "测试\n" % days_before(3))
+    new_row = ("2,%s 09:35,510300,沪深300ETF,SELL,4.000,1000,4000.00,5.00,"
+               "0,重放\n" % day)
+    with sandbox():
+        broker.load_account()
+        with open(broker.TRADE_FILE, "w", encoding="utf-8-sig", newline="") as f:
+            f.write(header + old_row)
+        raw_before = open(broker.TRADE_FILE, "rb").read()
+        n = runner._drop_today_trades(day)
+        check(n == 0, "没有今日成交却动了流水（返回 %r）" % n)
+        check(open(broker.TRADE_FILE, "rb").read() == raw_before,
+              "没有今日成交却重写了 trades.csv")
+
+        with open(broker.TRADE_FILE, "a", encoding="utf-8-sig", newline="") as f:
+            f.write(new_row)
+        n = runner._drop_today_trades(day)
+        text = open(broker.TRADE_FILE, encoding="utf-8-sig").read()
+        check(n == 1, "应剔除 1 行，实际 %r" % n)
+        check(day not in text, "今日流水没被剔掉：%s" % text)
+        check(days_before(3) in text, "历史流水被误删：%s" % text)
+        check(text.startswith("seq,time"), "表头被弄丢了：%s" % text[:40])
+        left = [f for f in os.listdir(runner.STATE) if f.endswith(".tmp")]
+        check(not left, "原子写留下了临时文件：%s" % left)
+
+    # 残缺行（只有一列）不能让重放崩掉
+    with sandbox():
+        broker.load_account()
+        with open(broker.TRADE_FILE, "w", encoding="utf-8-sig", newline="") as f:
+            f.write(header + "3\n" + new_row)
+        n = runner._drop_today_trades(day)
+        check(n == 1, "残缺行应当被保留、只删今日行，实际剔除 %r" % n)
+
+
+@case("大盘参照：510300 缺席时不能把 market_pct 静默变成 0.00%")
+def t_market_proxy_degraded():
+    """2026-11-14 发现。
+
+    `mkt = data.get("510300") or 第一只` 给了「没有 510300 就用代理」的意图，
+    但下面 asof_pct 写死只读 data["510300"]。于是 510300 当天没拉到分时、
+    别的标的正常时：mkt_pre 算出来了、mkt_ticks 却是空的 → 全天
+    market_pct=0.00% → R6 大盘熔断永不触发，而日志里看不出这是「判不了」。
+
+    这里让 510300 缺席、只有 159915 跌 3%（超过 market_filter -1.2%），
+    断言 ①market_pct 真的跟着 159915 走了（不是 0），②日志里明说了在用代理。
+    """
+    day = today()
+    n = len(session_minutes())
+    px = flat_prices(n, 4.0, -0.03)
+    ticks = mk_ticks(day, px)
+    q = {"159915": mk_quote("159915", px[-1])}
+    buf = io.StringIO()
+    with sandbox():
+        broker.load_account()
+        old = install_fake_market(
+            {"159915": {"ticks": ticks, "preclose": 4.0, "name": "创业板ETF"}}, q)
+        try:
+            with redirect_stdout(buf):
+                runner.run(verbose=True, execute=False,
+                           params=dict(strategy.PARAMS, mode="daytrade"))
+        finally:
+            restore_market(old)
+    out = buf.getvalue()
+    check("代理" in out, "510300 缺席时没有说明在用代理：%s" % out[-400:])
+    # market_pct 必须真的反映 159915 的 -3%，而不是 0
+    m = [ln for ln in out.splitlines() if "大盘(" in ln]
+    check(m, "输出里没有大盘一行：%s" % out[-400:])
+    check("-3.0" in m[0] or "-2.9" in m[0],
+          "大盘涨跌没跟着代理走（多半又是 0.00%%）：%s" % m[0])
+
+
+@case("分时混了别的交易日：不许把昨天的时间戳当成今天的回放时刻")
+def t_mixed_day_ticks():
+    """2026-11-14 加这道防线。
+
+    交易日守卫只要求「今天在出现的日期集合里」，所以只要有一只标的带了
+    昨天的 tick 就能整批通过。tlist 是全体 tick 的并集，_trim_to_session
+    只按时分过滤、不看日期 —— 于是「昨天 14:00 的价」会被当成今天的
+    成交时刻写进流水；那条流水的时间戳是昨天，_drop_today_trades 删不掉，
+    次日重放就是双份仓位，而现金与流水仍然自洽（doctor 查不出来）。
+    """
+    day = today()
+    yday = days_before(1)
+    n = 40
+    px_t = flat_prices(n, 4.0, -0.02)
+    px_y = flat_prices(n, 3.9, -0.02)
+    ticks = mk_ticks(yday, px_y) + mk_ticks(day, px_t)
+    q = {"510300": mk_quote("510300", px_t[-1])}
+    buf = io.StringIO()
+    with sandbox():
+        broker.load_account()
+        old = install_fake_market(
+            {"510300": {"ticks": ticks, "preclose": 4.0, "name": "沪深300ETF"}}, q)
+        try:
+            with redirect_stdout(buf):
+                runner.run(verbose=True, execute=True,
+                           params=dict(strategy.PARAMS, mode="daytrade",
+                                       entry_enabled=True, dev_enter=0.002,
+                                       rebound=0.0, mom_turn=-1.0))
+        finally:
+            restore_market(old)
+        rows = []
+        if os.path.exists(broker.TRADE_FILE):
+            with open(broker.TRADE_FILE, encoding="utf-8-sig") as f:
+                rows = [r for r in f.read().splitlines()[1:] if r.strip()]
+    check("丢弃" in buf.getvalue(), "混入别的交易日却没有留痕：%s" % buf.getvalue()[-300:])
+    bad = [r for r in rows if yday in r]
+    check(not bad, "流水里出现了昨天的成交时刻：%s" % bad)
 
 
 if __name__ == "__main__":

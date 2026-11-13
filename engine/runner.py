@@ -9,6 +9,7 @@
 """
 import argparse
 import csv
+import io
 import json
 import os
 import shutil
@@ -26,7 +27,7 @@ OPEN_FILE = os.path.join(STATE, "account_open.json")
 
 # 上一次 run() 为什么没执行（空串 = 正常跑完）。
 # not_trading_day / no_data / stale_data / no_quotes / pool_filtered /
-# strategy_changed —— 都是「返回 None」，但原因必须分开传出去：
+# strategy_changed / open_snapshot_corrupt —— 都是「返回 None」，但原因必须分开传出去：
 # 前两个是日历原因，中间两个是数据源故障，pool_filtered 是「有行情但没标的
 # 过门槛」（早盘成交额天然偏低），混成一个退出码，调用方就只能二选一地错报。
 LAST_SKIP = ""
@@ -39,6 +40,18 @@ LAST_PUSH = ("", "")
 # --------------------------------------------------------------------------
 class StrategyChanged(RuntimeError):
     """当日快照的策略指纹与当前参数不符：拒绝重放。"""
+
+
+class OpenSnapshotCorrupt(RuntimeError):
+    """当日开盘快照读不出来：无法确认今日开盘状态，拒绝重放。
+
+    2026-11-14 加。原来 `json.load` 读坏了会直接抛 JSONDecodeError 穿过
+    cloud_run 变成退出码 1（看起来像代码 bug），而「文件不存在」走的是
+    「首次运行、用当前账户重建快照」。把这两者合成一个 None 就等于：
+    快照读坏了 → 当成首次运行 → 用**已含今日成交**的账户重建开盘状态
+    → 下面 _drop_today_trades 又把今日流水删掉 → 账户里有仓位、流水里没有
+    → 次日一重放就是双份仓位，且账本看起来完全正常（现金仍与流水自洽）。
+    """
 
 
 def params_sig(params=None):
@@ -60,6 +73,30 @@ def params_sig(params=None):
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
 
 
+def _read_open_snapshot():
+    """读当日开盘快照，三态：没有(None) / 读到(dict) / 读坏了(抛 OpenSnapshotCorrupt)。
+
+    2026-11-14 加。「没有」和「读坏了」必须分开——见 OpenSnapshotCorrupt 的说明。
+    """
+    if not os.path.exists(OPEN_FILE):
+        return None
+    try:
+        with open(OPEN_FILE, "r", encoding="utf-8") as f:
+            raw = f.read()
+    except OSError as e:
+        raise OpenSnapshotCorrupt("读不出来（%s）：%s" % (type(e).__name__, e))
+    if not raw.strip():
+        # 空文件：被截断的写（旧代码直接 open("w")，被 kill 就留 0 字节）。
+        raise OpenSnapshotCorrupt("文件是空的（0 字节，典型的写一半被杀）")
+    try:
+        op = json.loads(raw)
+    except ValueError as e:
+        raise OpenSnapshotCorrupt("不是合法 JSON（%s）" % e)
+    if not isinstance(op, dict) or not isinstance(op.get("account"), dict):
+        raise OpenSnapshotCorrupt("结构不对（缺 account 对象）")
+    return op
+
+
 def reset_to_open(day, params=None):
     """把账户恢复到当日开盘状态（幂等前提）。
 
@@ -79,42 +116,62 @@ def reset_to_open(day, params=None):
     """
     cur = broker.load_account()
     sig = params_sig(params)
-    if os.path.exists(OPEN_FILE):
-        with open(OPEN_FILE, "r", encoding="utf-8") as f:
-            op = json.load(f)
-        if op.get("date") == day:
-            old = op.get("params_sig")
-            # 没有指纹的老快照同样要拦：无法确认当日策略是否变过，
-            # 就不能假设它没变。宁可停一天，也不能赌。
-            if old != sig:
-                raise StrategyChanged(
-                    "策略参数在盘中发生了变更（快照 %s → 当前 %s）。"
-                    "今日拒绝重放：重放会用早盘价格执行刚刚才做出的决定，"
-                    "属于前视偏差，并且会覆盖当日已经真实发生的成交。"
-                    "新策略从下一个交易日开始生效。"
-                    % (old or "（无指纹的旧快照）", sig))
-            acc = op["account"]
-            broker.save_account(acc)
-            _drop_today_trades(day)
-            return acc
-    # 当日首次运行：把当前账户存档为开盘状态，并记下策略指纹
-    with open(OPEN_FILE, "w", encoding="utf-8") as f:
-        json.dump({"date": day, "account": cur, "params_sig": sig}, f,
-                  ensure_ascii=False, indent=2)
+    op = _read_open_snapshot()
+    if op is not None and op.get("date") == day:
+        old = op.get("params_sig")
+        # 没有指纹的老快照同样要拦：无法确认当日策略是否变过，
+        # 就不能假设它没变。宁可停一天，也不能赌。
+        if old != sig:
+            raise StrategyChanged(
+                "策略参数在盘中发生了变更（快照 %s → 当前 %s）。"
+                "今日拒绝重放：重放会用早盘价格执行刚刚才做出的决定，"
+                "属于前视偏差，并且会覆盖当日已经真实发生的成交。"
+                "新策略从下一个交易日开始生效。"
+                % (old or "（无指纹的旧快照）", sig))
+        acc = op["account"]
+        broker.save_account(acc)
+        _drop_today_trades(day)
+        return acc
+    # 当日首次运行：把当前账户存档为开盘状态，并记下策略指纹。
+    # 必须原子写：runner 在云端会被 timeout-minutes / concurrency 取消，
+    # 直接 "w" 打开目标文件被 kill 就是 0 字节的 account_open.json，
+    # 下一轮读到它只能拒绝执行（这次是有意的，见 OpenSnapshotCorrupt）。
+    broker._atomic_write_text(
+        OPEN_FILE,
+        json.dumps({"date": day, "account": cur, "params_sig": sig},
+                   ensure_ascii=False, indent=2))
     _drop_today_trades(day)
     return cur
 
 
 def _drop_today_trades(day):
+    """剔除今日流水（重放前先清干净，否则重复记账）。
+
+    2026-11-14 两处修：
+      1. **没有今日成交时一个字节都不动。** 原来无论有没有今日行都把整张
+         trades.csv 读出来重写一遍——云端每 5 分钟一轮，一天要整表重写
+         ~50 次。这份文件是账本唯一的历史，为一次空操作反复冒险不值得。
+      2. **改成原子写。** 原来是 open("w") 直接覆盖：进程被 timeout /
+         concurrency 取消在写一半，trades.csv 就永远停在被截断的位置，
+         历史成交永久丢失（2026-11-10 state/baseline.json 被写成一堆 NUL
+         字节就是同类事故，broker 早已改用 _atomic_write_text，这里却漏了）。
+    另修：单列残缺行不再抛 IndexError（原来 r[1] 裸取）。
+    """
     if not os.path.exists(broker.TRADE_FILE):
-        return
+        return 0
     with open(broker.TRADE_FILE, "r", encoding="utf-8-sig") as f:
         rows = list(csv.reader(f))
     if not rows:
-        return
-    keep = [rows[0]] + [r for r in rows[1:] if r and not r[1].startswith(day)]
-    with open(broker.TRADE_FILE, "w", newline="", encoding="utf-8-sig") as f:
-        csv.writer(f).writerows(keep)
+        return 0
+    keep = [rows[0]] + [r for r in rows[1:]
+                        if r and not (len(r) > 1 and r[1].startswith(day))]
+    if len(keep) == len(rows):
+        return 0
+    buf = io.StringIO(newline="")
+    csv.writer(buf).writerows(keep)
+    broker._atomic_write_text(broker.TRADE_FILE, buf.getvalue(),
+                              encoding="utf-8-sig", newline="")
+    return len(rows) - len(keep)
 
 
 def _fix_seq(acc):
@@ -155,9 +212,12 @@ def _heartbeat(day, snap, events):
         "auto": True,
     }
     try:
-        with open(HEARTBEAT, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        # 原子写：这份文件同时被 selfcheck/doctor 读来判「有没有漏跑」，
+        # 被截断就成了「没跑过」——那是最不该误判的一项。
+        broker._atomic_write_text(
+            HEARTBEAT, json.dumps(data, ensure_ascii=False, indent=2))
     except Exception:  # noqa: BLE001
+        # 心跳失败不影响账本（账本才是唯一的真相），但不能升级成异常
         pass
 
 
@@ -315,6 +375,31 @@ def run(verbose=True, params=None, execute=True, ttl=600):
         print("  [降级] %s 的数据来自缓存，本轮重放窗口被截短"
               % "、".join("%s@%s" % (c, t) for c, t in sorted(degraded)))
 
+    # 只保留今天的分钟线。守卫只要求「今天出现过」，所以只要有一只标的带了
+    # 昨天的 tick 就能整批通过 —— 而 tlist 是全体 tick 的并集，混进来的
+    # 昨天时间戳会被当成正常的回放时刻：_trim_to_session 只按时分过滤、
+    # 不看日期，于是「昨天 14:00 的价」会被当作今天的成交价写进流水；
+    # 那条流水的时间戳是昨天，_drop_today_trades 删不掉，次日重放就是
+    # 双份仓位，而现金与流水仍然自洽（doctor 查不出来）。
+    # 腾讯当日分时只有一天，东财 ndays=1 理论也只有一天，但缓存拼接/接口
+    # 改口径都可能出多日；这里按日期硬隔离，丢弃根数要念出来。
+    mixed = 0
+    for c in list(data):
+        tr = data[c]
+        only = [t for t in tr["ticks"] if (t.get("t") or "")[:10] == day]
+        if len(only) != len(tr["ticks"]):
+            mixed += len(tr["ticks"]) - len(only)
+            data[c] = {**tr, "ticks": only}
+        if not only:
+            del data[c]
+    if mixed:
+        print("  [警告] 丢弃 %d 根非今日(%s)的分钟线（分时里混了别的交易日）"
+              % (mixed, day))
+    if not data:
+        LAST_SKIP = "no_data"
+        print("剔除非今日分钟线后已无可用分时")
+        return None
+
     # 守卫通过后才动账本。顺序很重要：先确认今天真的有行情，再存档、再放账本。
     if execute:
         try:
@@ -324,6 +409,18 @@ def run(verbose=True, params=None, execute=True, ttl=600):
             # 也不能用早盘价格执行刚做出的决定，更不能覆盖真实成交。
             LAST_SKIP = "strategy_changed"
             print("  [拒绝执行] %s" % e)
+            return None
+        except OpenSnapshotCorrupt as e:
+            # 快照读坏了：不能重建（会用已含今日成交的账户冒充开盘状态），
+            # 也不能当成「首次运行」（那正是重建）。停一天，等人看。
+            # 这条必须单独一个原因：混进 stale_data/no_data 就成了「数据源故障」，
+            # 而真正坏的是本地账本，重试一百次也不会自己好。
+            LAST_SKIP = "open_snapshot_corrupt"
+            print("  [拒绝执行] 当日开盘快照 %s %s。" % (OPEN_FILE, e))
+            print("             无法确认今日开盘状态，拒绝重建（重建会用已含今日"
+                  "成交的账户冒充开盘状态，写出来的账本看着正常但是错的）。")
+            print("             处理：从 git 恢复该文件（git checkout -- state/"
+                  "account_open.json），或确认当日无成交后手工删除它。")
             return None
     # dry 也要把日期推到今天：否则 snapshot 会把今天的净值写进昨天那一行
     broker.roll_day(acc, day)
@@ -335,8 +432,24 @@ def run(verbose=True, params=None, execute=True, ttl=600):
     tlist = sorted(tl)
 
     # 大盘参照（沪深300 ETF 作为市场代理，避免再请求指数接口）
+    #
+    # 2026-11-14 修：这里原来写成「mkt 取 510300，没有就取第一只」，
+    # 但下面 asof_pct 的前向填充又写死只认 data["510300"]。两者不一致的后果：
+    # 510300 当天没拉到时 mkt 拿到了代理、mkt_pre 也算出来了，可 mkt_ticks
+    # 是空的 → asof_pct 全程 0.0 → R6 大盘熔断（market_filter=-1.2%）永不触发，
+    # 日志里大盘永远是 +0.00%，看不出这是「判不了」还是「真的没跌」。
+    # 现在统一使用 mkt，并把「代理不是 510300」这件事念出来——代理的口径
+    # 与沪深300 不可比，此时 R6 的阈值只是一个近似。
     mkt = data.get("510300") or list(data.values())[0]
-    mkt_pre = mkt["preclose"] or mkt["ticks"][0]["price"]
+    mkt_ticks = mkt.get("ticks") or []
+    mkt_pre = mkt.get("preclose") or (mkt_ticks[0]["price"] if mkt_ticks else 0.0)
+    if "510300" not in data:
+        print("  [降级] 沪深300ETF 今日无分时，大盘涨跌改用 %s 代理："
+              "R6 熔断阈值(%.2f%%)此时只是近似"
+              % (mkt.get("code"), float(params.get("market_filter") or 0) * 100))
+    if not mkt_pre:
+        print("  [警告] 大盘参照没有前收也没有首根价，market_pct 只能给 0.00%"
+              "（R6 熔断本轮等于关闭，这不是「大盘没跌」）")
 
     idx = {c: {t["t"]: k for k, t in enumerate(tr["ticks"])} for c, tr in data.items()}
     ctx = {"trades": 0, "market_pct": 0.0, "preclose": None}
@@ -344,11 +457,11 @@ def run(verbose=True, params=None, execute=True, ttl=600):
     # 大盘涨跌按「决策分钟」前向填充：decide 读的是 ticks[k-1]，用第 i 分钟
     # 的价就等于提前一分钟看到还没发生的下跌（前视）。回测里 2026-11-05 实测
     # 复现过同一处：09:59 才崩的指数，09:58 的决策里已经算进去了。
-    mkt_ticks = data["510300"]["ticks"] if "510300" in idx else []
     asof_pct, last_pct, mi = {}, 0.0, 0
     for tt in tlist:
         while mi < len(mkt_ticks) and mkt_ticks[mi]["t"] <= tt:
-            last_pct = (mkt_ticks[mi]["price"] / mkt_pre - 1) * 100
+            if mkt_pre:
+                last_pct = (mkt_ticks[mi]["price"] / mkt_pre - 1) * 100
             mi += 1
         asof_pct[tt] = last_pct
     pos = None
@@ -367,6 +480,16 @@ def run(verbose=True, params=None, execute=True, ttl=600):
                          for c, p in acc["positions"].items())))
     elif acc.get("positions"):
         c0 = next(iter(acc["positions"]))
+        # 单标的模式只管一只。多出来的那些既不续管也不平仓：它们会一直留在
+        # 账上，止盈止损、尾盘强平、时间止损统统不生效，而每天的输出里
+        # 一句提示都没有——看起来像「策略选择了继续持有」。
+        # 现实中只有一种来路：从 mix 组合切回单标的时留下的仓位。
+        extra = [c for c in acc["positions"] if c != c0]
+        if extra:
+            print("  [警告] 非组合模式下只管理 %s，另有 %d 个持仓不受任何规则"
+                  "管辖（%s）：不会止盈止损、不会强平，会一直留在账上。"
+                  "若这是组合切单标的的遗留，请手工处理。"
+                  % (c0, len(extra), "、".join(extra)))
         if c0 in data:
             pos = {"code": c0,
                    "entry": broker.avg_cost(acc["positions"][c0]),
@@ -682,6 +805,12 @@ def run(verbose=True, params=None, execute=True, ttl=600):
               % "、".join(snap["unpriced"]))
 
     if verbose:
+        # 汇总里的大盘涨跌：取当天最后一分钟的 asof_pct（已按「决策那一分钟」对齐）。
+        # 2026-11-14 补：2026-11-05 修前视偏差时把循环里的 ctx["market_pct"]
+        # 更新一起删掉了，此处再没人赋值 → 汇总恒印「+0.00%」。
+        # 那行看着像「大盘平盘」，其实是没算——R6 熔断当天到底有没有被触发，
+        # 从输出里完全看不出来。
+        ctx["market_pct"] = asof_pct.get(tlist[-1], 0.0)
         print("=" * 62)
         print(f"  模拟盘执行  {now:%Y-%m-%d %H:%M}   数据截止 {tlist[-1][11:]}")
         print("=" * 62)

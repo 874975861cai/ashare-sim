@@ -24,6 +24,8 @@ from datetime import datetime
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "engine"))
 
+import broker   # noqa: E402  仓位口径只认 broker（账本是 lots 结构）
+
 OK, WARN, ERR = "OK  ", "WARN", "ERR "
 results = []
 
@@ -113,7 +115,11 @@ def check_ledger():
     pos = acc.get("positions") or {}
     cost = 0.0
     for code, p in pos.items():
-        cost += float(p.get("shares", 0)) * float(p.get("cost", 0))
+        # 2026-11-14 修：原来读 p["shares"] / p["cost"]，而账本里的仓位是
+        # {"lots": [...], "realized": ...}，这两个键根本不存在 → 成本恒为
+        # ¥0.00，下面「现金+成本远超本金」那道校验等于永久关闭。
+        # 屏幕上那句「成本 ¥0.00」是唯一的线索，但它看着像正常输出。
+        cost += broker.position_shares(p) * broker.avg_cost(p)
 
     add(OK, "现金", "¥%.2f" % cash)
     add(OK, "持仓", "%d 只，成本 ¥%.2f" % (len(pos), cost))
@@ -136,9 +142,24 @@ def check_ledger():
             add(OK, "流水条数", "%d 条，与序号一致" % len(rows))
 
     # 今日开盘快照
+    # 2026-11-14 修：原来只看「文件在不在」就报「幂等重放可用」。
+    # 存在不等于能读——被写一半的 0 字节/半截 JSON 也「存在」，
+    # 而 runner 读到它只能拒绝执行。这条谎报会让人以为幂等前提还在。
     op = os.path.join(ROOT, "state/account_open.json")
     if os.path.exists(op):
-        add(OK, "开盘快照", "存在（幂等重放可用）")
+        try:
+            with open(op, "r", encoding="utf-8") as f:
+                raw = f.read()
+            snap = json.loads(raw) if raw.strip() else None
+        except (OSError, ValueError) as e:
+            add(ERR, "开盘快照", "存在但读不出来（%s），runner 今日会拒绝重放"
+                % type(e).__name__)
+        else:
+            if isinstance(snap, dict) and isinstance(snap.get("account"), dict):
+                add(OK, "开盘快照", "存在且可读（%s，幂等重放可用）"
+                    % (snap.get("date") or "无日期"))
+            else:
+                add(ERR, "开盘快照", "结构不对（缺 account），runner 今日会拒绝重放")
     else:
         add(WARN, "开盘快照", "缺失，下次 runner 会重建")
 
