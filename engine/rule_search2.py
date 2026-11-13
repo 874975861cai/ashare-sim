@@ -27,6 +27,12 @@ import json
 import os
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# ⚠️ 已知技术债（待人工确认，不要默默当正确）：这里读的是
+# state/cache/daykline_3y.json，一份**前复权**序列（等差口径），最后更新于
+# 2026-10-28，既旧又有口径偏差——高分红标的（如 510880）的买入持有收益会被
+# 系统性高估约 19pp（详见 riskstudy.load_bars 的注释）。同族的 rule_search.py
+# 已于 2026-11-12 改用 riskstudy.load_bars（后复权 + 缓存/过期判定）。本文件应
+# 同步迁移；迁移会改变全部结论，需用户拍板，故暂未动。
 CACHE = os.path.join(BASE, "state", "cache", "daykline_3y.json")
 
 COST = 0.0018
@@ -50,7 +56,15 @@ def load():
     return data
 
 
+# 「窗口内一根可成交 K 线都没有」的哨兵。不能与 [] / None 混用：那两者经过
+# stat()/line() 会被印成「0 笔（规则未触发）」，把「根本没评估」和「评估过、
+# 没信号」合成同一句结论（2026-11-13 修，与 rule_search.py 同款）。
+NO_DATA = object()
+
+
 def stat(rets):
+    if rets is NO_DATA:
+        return NO_DATA
     if not rets:
         return None
     cum = 1.0
@@ -64,8 +78,10 @@ def stat(rets):
 
 
 def line(tag, s):
+    if s is NO_DATA:
+        return "%-34s %s" % (tag, "窗口内无数据（未评估）")
     if not s:
-        return "%-34s %s" % (tag, "0 笔")
+        return "%-34s %s" % (tag, "0 笔（有数据，规则未触发）")
     return ("%-34s %3d笔 胜率%5.1f%% 单笔%+6.2f%% 累计%+7.2f%% 最差%+6.2f%%"
             % (tag, s["n"], s["win"], s["avg"], s["cum"], s["worst"]))
 
@@ -89,7 +105,9 @@ def dual_momentum(data, look, rebal, abs_band=0.0, lo=None, hi=None):
     # 区间内允许评估的最早/最晚下标（要留一根给次日成交）
     ks = [i for i, d in enumerate(dates) if lo <= d < hi]
     if len(ks) < 3:
-        return []
+        # 窗口内可成交日不足 3 根：根本没评估，必须返回 NO_DATA，
+        # 不能返回 [] 让下游印成「0 笔（规则未触发）」。
+        return NO_DATA
     i_start, i_end = ks[0], ks[-1]
 
     rets = []
@@ -181,7 +199,9 @@ def main():
                 tag = "回看%d/调仓%d日/阈值%.0f%%" % (look, rebal, band * 100)
                 print(line(tag + " 内", sa))
                 print(line(tag + " 外", so))
-                if sa and so and sa["n"] >= 8 and so["n"] >= 4 \
+                # a/o 可能是 NO_DATA（窗口无数据），不是 dict；先排除再取字段
+                if isinstance(sa, dict) and isinstance(so, dict) \
+                        and sa["n"] >= 8 and so["n"] >= 4 \
                         and sa["cum"] > 0 and so["cum"] > 0:
                     comb = (1 + sa["cum"] / 100) * (1 + so["cum"] / 100) - 1
                     best.append((comb, tag, sa, so))

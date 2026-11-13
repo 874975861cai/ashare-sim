@@ -41,6 +41,7 @@ import market
 import optimize    # noqa: E402
 import riskstudy   # noqa: E402
 import rule_search  # noqa: E402
+import rule_search2  # noqa: E402
 import weekly     # noqa: E402      # noqa: E402
 import push_repo   # noqa: E402
 import push_cloud  # noqa: E402
@@ -51,7 +52,7 @@ VERBOSE = False
 CASES = []
 # 用例总数基线（见 main() 里的说明：少了要红，不是"通过 41 项"）。
 # 2026-10-19 建 1 条起算，每加一条用例都要同步改这里。
-EXPECTED_CASES = 70
+EXPECTED_CASES = 71
 
 
 def case(name):
@@ -2416,6 +2417,32 @@ def t_rule_no_data_exit():
     finally:
         riskstudy.load_bars, rule_search.POOL = real
     check(code == 1, "全失败时应返回 1，实际 %r" % code)
+
+
+@case("规则搜索2：窗口内无数据 ≠ 规则未触发")
+def t_rule2_nodata():
+    """rule_search2 是同族研究脚本，必须和 rule_search 一样把「窗口内没评估」
+    与「评估过、没出信号」分开印。旧版 dual_momentum 窗口不足 3 根时返回 []，
+    stat([])→None、line() 印「0 笔」，与「有数据没触发」长得一样。
+    """
+    NO_DATA = rule_search2.NO_DATA
+    bars = [{"date": "2024-01-%02d" % d, "open": 10.0, "close": 10.0,
+             "high": 10.0, "low": 10.0} for d in range(1, 6)]
+    data = {"AAA": bars, "BBB": bars}
+    # 窗口只含 2 个可成交日 → 无数据，必须 NO_DATA，不能 []
+    rs = rule_search2.dual_momentum(data, 2, 10, 0.0, "2024-01-01", "2024-01-03")
+    check(rs is NO_DATA, "窗口不足 3 个可成交日必须返回 NO_DATA，实际 %r" % (rs,))
+    # 够长的窗口返回列表（可能 0 笔，但必须是评估过的，不能是 NO_DATA）
+    rs2 = rule_search2.dual_momentum(data, 2, 10, 0.0, "2024-01-01", "2024-01-06")
+    check(rs2 is not NO_DATA, "窗口足够却返回 NO_DATA：%r" % (rs2,))
+    check(isinstance(rs2, list), "正常窗口应返回列表，实际 %r" % (rs2,))
+    check(rule_search2.stat(NO_DATA) is NO_DATA, "stat 吞掉了 NO_DATA 哨兵")
+    s_nd = rule_search2.line("X 外", rule_search2.stat(NO_DATA))
+    s_zr = rule_search2.line("X 内", rule_search2.stat([]))
+    check("未评估" in s_nd and "规则未触发" not in s_nd,
+          "无数据被印成规则结论：%s" % s_nd)
+    check("规则未触发" in s_zr and "未评估" not in s_zr,
+          "有数据未触发被印成无数据：%s" % s_zr)
 
 
 if __name__ == "__main__":
