@@ -52,7 +52,7 @@ VERBOSE = False
 CASES = []
 # 用例总数基线（见 main() 里的说明：少了要红，不是"通过 41 项"）。
 # 2026-10-19 建 1 条起算，每加一条用例都要同步改这里。
-EXPECTED_CASES = 76
+EXPECTED_CASES = 77
 
 
 def case(name):
@@ -182,6 +182,55 @@ def seed_position(acc, code, shares, price, day):
     acc["cash"] = round(acc["cash"] - shares * price - 5.0, 2)
     broker.save_account(acc)
     return acc
+
+
+# --------------------------------------------------------------------------
+# 组合（mix）夹具：目标权重一律从 strategy.PARAMS 推导，不写死
+# --------------------------------------------------------------------------
+# 2026-11-14 教训：这些用例原本把 40/30/30 + 159915 抄在断言里。配比改成
+# 45/30/25（159915 -> 511260）的那一刻，8 条用例一起红，doctor 直接报
+# 「端到端自测 8 项失败」——看上去像代码坏了，其实是测试把配置抄了一遍。
+# 配比是策略变量，测试该断言的是**行为**（每条目标腿都建满、只减超配、
+# 欠配要买、缺报价算判不了），不是某一组具体数字。
+MIX_TEST_PX = {"513100": 1.80, "518880": 3.60, "159915": 2.40,
+               "511260": 1.20, "510880": 3.37, "510300": 3.00, "510500": 6.70}
+
+
+def mix_legs(params=None):
+    """当前组合的目标腿 [(code, 权重)]，按代码排序（与 plan_mix 的下单顺序一致）。"""
+    w = strategy._mix_weights(params or strategy.PARAMS) or {}
+    if not w:
+        raise AssertionError("mix_weights 为空，组合用例没有意义")
+    return sorted(w.items())
+
+
+def mix_px(params=None):
+    """目标腿的假报价。缺价立刻报错——不要静默补一个默认值把用例糊过去。"""
+    out = {}
+    for c, _w in mix_legs(params):
+        if c not in MIX_TEST_PX:
+            raise AssertionError(
+                "组合里新增了标的 %s，请在 selftest.MIX_TEST_PX 给它一个假报价，"
+                "否则这些用例会拿不到报价、静默退化成「只建了两只」" % c)
+        out[c] = MIX_TEST_PX[c]
+    return out
+
+
+def mix_main(legs=None):
+    """权重最大的那条腿（用例里用来制造「单只脱靶」）。"""
+    return max(legs or mix_legs(), key=lambda x: x[1])[0]
+
+
+def mix_shares_for(eq, code, wt, px=None):
+    """占 eq*wt 的整手股数，向下取整 —— 与 plan_mix 同口径。"""
+    px = px or mix_px()
+    return int(eq * wt / px[code] / 100) * 100
+
+
+def mix_holdings(eq, px=None):
+    """按目标权重造一份「正好在带内」的整手持仓。"""
+    px = px or mix_px()
+    return {c: mix_shares_for(eq, c, wt, px) for c, wt in mix_legs()}
 
 
 # ==========================================================================
@@ -564,23 +613,24 @@ def t_overnight():
               % [r["reason"] for r in rows if r["side"] == "SELL"])
 
 
-@case("组合模式：按 40/30/30 建仓，且不做尾盘强平")
+@case("组合模式：每条目标腿都要建满，且不做尾盘强平")
 def t_mix_build():
-    """mode="mix" 的核心行为：一次建三只、权重到位、之后整天不动。
+    """mode="mix" 的核心行为：一次建满全部目标腿、权重到位、之后整天不动。
 
     这里最要紧的是「不做尾盘强平」。runner 有两处强平（循环内 + 收盘兜底），
     2026-11-07 切模式时两处都改成了 `mode not in ("hold","mix")`。若漏一处，
     组合会在 14:50 被清空——而日志上会写成「尾盘强平」，看起来像正常动作。
     """
+    legs = mix_legs()
+    raw = mix_px()
     with sandbox():
         acc = broker.load_account()
         acc["cash"] = 100000.0
         acc["meta"]["init_capital"] = 100000.0
-        acc["meta"]["max_positions"] = 3
+        acc["meta"]["max_positions"] = len(legs)
         broker.save_account(acc)
         day = today()
         n = len(session_minutes())
-        raw = {"513100": 1.80, "518880": 3.60, "159915": 2.40}
         trends, quotes = {}, {}
         for c, p in raw.items():
             trends[c] = {"ticks": mk_ticks(day, flat_prices(n, p), preclose=p),
@@ -594,14 +644,16 @@ def t_mix_build():
         finally:
             restore_market(old)
         check(r is not None, "组合模式没跑到收盘（行情被误判成非交易日）")
-        check(len(a["positions"]) == 3,
-              "组合应持有 3 只，实际 %s" % list(a["positions"]))
+        check(sorted(a["positions"]) == sorted(c for c, _ in legs),
+              "组合应持有 %d 只 %s，实际 %s"
+              % (len(legs), [c for c, _ in legs], list(a["positions"])))
         mv = {c: broker.position_shares(p) * raw[c]
               for c, p in a["positions"].items()}
         eq = a["cash"] + sum(mv.values())
-        for c, w in strategy.PARAMS["mix_weights"].items():
-            check(abs(mv[c] / eq - w) < 0.05,
-                  "%s 权重 %.1f%% 偏离目标 %.0f%%" % (c, mv[c] / eq * 100, w * 100))
+        for c, w in legs:
+            check(abs(mv.get(c, 0.0) / eq - w) < 0.05,
+                  "%s 权重 %.1f%% 偏离目标 %.0f%%"
+                  % (c, mv.get(c, 0.0) / eq * 100, w * 100))
         check(a["cash"] >= 0, "现金为负：%.2f" % a["cash"])
         check(not any(r0["side"] == "SELL" for r0 in rows),
               "刚建仓不该有卖出：%s" % [r0["reason"] for r0 in rows])
@@ -614,16 +666,18 @@ def t_mix_evict():
     不能靠手工改账本清仓——那等于用收盘价虚构一笔成交。这里验证
     「移出组合」这条路径真的会把钱腾出来并投进目标标的。
     """
+    legs = mix_legs()
+    raw = mix_px()
+    raw["510880"] = MIX_TEST_PX["510880"]
     with sandbox():
         acc = broker.load_account()
         acc["cash"] = 90224.10
         acc["meta"]["init_capital"] = 100169.60
-        acc["meta"]["max_positions"] = 3
+        acc["meta"]["max_positions"] = len(legs)
         seed_position(acc, "510880", 2900, 3.40, days_before(9))
         broker.save_account(acc)
         day = today()
         n = len(session_minutes())
-        raw = {"513100": 1.80, "518880": 3.60, "159915": 2.40, "510880": 3.37}
         trends, quotes = {}, {}
         for c, p in raw.items():
             trends[c] = {"ticks": mk_ticks(day, flat_prices(n, p), preclose=p),
@@ -637,10 +691,9 @@ def t_mix_evict():
             restore_market(old)
         check("510880" not in a["positions"],
               "旧持仓没被移出：%s" % list(a["positions"]))
-        check(len(a["positions"]) == 3,
-              "移出后应建满 3 只，实际 %s" % list(a["positions"]))
-        check(any(c in a["positions"] for c in ("513100", "518880", "159915")),
-              "移出旧仓后没有买入新标的")
+        check(sorted(a["positions"]) == sorted(c for c, _ in legs),
+              "移出后应建满 %d 只 %s，实际 %s"
+              % (len(legs), [c for c, _ in legs], list(a["positions"])))
 
 
 @case("入金：追加资金不能算成当日盈利")
@@ -743,17 +796,21 @@ def t_flow_bad():
 @case("组合：权重在偏离带内不动，脱靶才拉回")
 def t_mix_band():
     """再平衡频率决定成本。带内频繁微调会把收益磨成手续费。"""
+    legs = mix_legs()
+    px = mix_px()
     eq = 100000.0
-    px = {"513100": 1.80, "518880": 3.60, "159915": 2.40}
-    # 39.96% / 29.88% / 30.00%，全部贴着目标，不该有任何指令
-    near = {"513100": 22200, "518880": 8300, "159915": 12500}
+    near = mix_holdings(eq, px)
     o1, _d1 = strategy.plan_mix(eq, near, px)
     check(not o1, "权重在带内却下了单：%s" % o1)
-    # 90% 压在纳指上，必须减回来
-    far = {"513100": 50000, "518880": 1000, "159915": 1000}
+    # 90% 压在主腿（权重最大的那条）上，必须减回来
+    main = mix_main(legs)
+    far = {main: mix_shares_for(eq, main, 0.90, px)}
+    for c, _w in legs:
+        if c != main:
+            far[c] = mix_shares_for(eq, c, 0.02, px)
     o2, _d2 = strategy.plan_mix(eq, far, px)
-    check(any(o["code"] == "513100" and o["side"] == "SELL" for o in o2),
-          "纳指脱靶却没减仓：%s" % o2)
+    check(any(o["code"] == main and o["side"] == "SELL" for o in o2),
+          "%s 脱靶却没减仓：%s" % (main, o2))
     check(all(o["shares"] % 100 == 0 for o in o2),
           "下单必须是整手：%s" % o2)
 
@@ -764,34 +821,42 @@ def t_mix_rebal():
 
     旧代码拿 budget（= 现有现金 + 卖出所得）乘权重算目标股数。满仓时
     现金≈0，于是每个目标都算成 0：
-      · 57%（目标 40%）的 513100 被整笔卖出 31600 份，不是减到 40%；
-      · 21%（目标 30%）的两只「在带内不动」，腾出的 5.7 万现金躺到明年；
-      · 更荒诞的一组：低配到 15% 的 159915 也被「减至 30%(现 15%)」卖掉 4450 份。
-    两个方向都错，而流水上的理由文字完全正常，事后只看得见「减至 30%」。
+      · 主腿超配的那部分被整笔卖出，不是减到目标；
+      · 未超配的腿「在带内不动」，腾出的现金躺到明年；
+      · 更荒诞的一组：低配的腿也被「减至 X%」反向卖掉。
+    两个方向都错，而流水上的理由文字完全正常，事后只看得见「减至 X%」。
     """
-    px = {"513100": 1.80, "518880": 3.60, "159915": 2.40}
-    w = strategy.PARAMS["mix_weights"]
-    # 60/20/20 量级的漂移：只有纳指脱靶
-    h = {"513100": 31600, "518880": 6100, "159915": 8700}
-    eq = sum(h[c] * px[c] for c in h)
-    orders, diag = strategy.plan_mix(eq, h, px)
+    legs = mix_legs()
+    px = mix_px()
+    w0 = dict(legs)
+    main = mix_main(legs)
+    others = [c for c, _w in legs if c != main]
+    eq = 100000.0
+    # 主腿比目标高 20pp，其余腿平分剩下的
+    over = 0.20
+    rest_w = (1.0 - (w0[main] + over)) / max(len(others), 1)
+    h = {main: mix_shares_for(eq, main, w0[main] + over, px)}
+    for c in others:
+        h[c] = mix_shares_for(eq, c, rest_w, px)
+    eq_a = sum(h[c] * px[c] for c in h)
+    orders, diag = strategy.plan_mix(eq_a, h, px)
     got = {o["code"]: (o["side"], o["shares"]) for o in orders}
-    check(got.get("513100", ("", 0))[0] == "SELL",
-          "纳指脱靶却没减仓：%s" % orders)
-    check(got.get("513100", ("", 0))[1] < h["513100"] * 0.8,
+    check(got.get(main, ("", 0))[0] == "SELL",
+          "%s 脱靶却没减仓：%s" % (main, orders))
+    check(got.get(main, ("", 0))[1] < h[main] * 0.8,
           "减仓幅度太小，没拉回目标：卖 %d / 持有 %d"
-          % (got.get("513100", ("", 0))[1], h["513100"]))
-    check(got.get("513100", ("", 0))[1] > 0,
-          "再把平衡当成清仓了：卖出全部 %d 份" % h["513100"])
-    for c in ("518880", "159915"):
+          % (got.get(main, ("", 0))[1], h[main]))
+    check(got.get(main, ("", 0))[1] > 0,
+          "再把平衡当成清仓了：卖出全部 %d 份" % h[main])
+    for c in others:
         check(got.get(c, ("", 0))[0] != "SELL",
               "低配的 %s 被卖出了：%s（应买不应卖）" % (c, orders))
-    # 按指令执行后，三只权重都应回到目标附近（±3pp），现金不留大块
+    # 按指令执行后，每条腿都应回到目标附近（±3pp），现金不留大块
     after = dict(h)
     for o in orders:
         after[o["code"]] += o["shares"] if o["side"] == "BUY" else -o["shares"]
-    for c, wt in w.items():
-        real = after.get(c, 0) * px[c] / eq
+    for c, wt in legs:
+        real = after.get(c, 0) * px[c] / eq_a
         check(abs(real - wt) < 0.03,
               "%s 调仓后权重 %.1f%%，目标 %.0f%%（差得太多）"
               % (c, real * 100, wt * 100))
@@ -800,40 +865,68 @@ def t_mix_rebal():
 
 @case("组合：低配标的要求买进，不能被现金预算算成卖出")
 def t_mix_underweight():
-    """15% 对 30% 是欠配，必须买。旧代码把它算成「减至 30%」卖了 4450 份。"""
-    px = {"513100": 1.80, "518880": 3.60, "159915": 2.40}
-    h = {"513100": 22222, "518880": 8333, "159915": 6250}   # 40/30/15
-    cash = 15000.0
-    eq = sum(h[c] * px[c] for c in h) + cash
-    orders, _ = strategy.plan_mix(eq, h, px)
+    """欠配就是欠配，必须买。旧代码把它算成「减至 X%」反向卖掉了。"""
+    legs = mix_legs()
+    px = mix_px()
+    under = min(legs, key=lambda x: x[1])[0]
+    eq = 100000.0
+    h = {c: mix_shares_for(eq, c, wt * (0.5 if c == under else 1.0), px)
+         for c, wt in legs}
+    mv = sum(h[c] * px[c] for c in h)
+    eq_a = mv + (eq - mv)                      # 缺的那半份留在现金里
+    orders, _ = strategy.plan_mix(eq_a, h, px)
     got = {o["code"]: o for o in orders}
-    check("159915" in got and got["159915"]["side"] == "BUY",
-          "欠配的 159915 没买进：%s" % orders)
+    check(under in got and got[under]["side"] == "BUY",
+          "欠配的 %s 没买进：%s" % (under, orders))
     check(not any(o["side"] == "SELL" for o in orders),
           "没有超配标的，却产生了卖单：%s" % orders)
 
 
 @case("组合：权益非正 / 权重为空时必须停手，不能「合法地」清零仓位")
 def t_mix_guard():
-    px = {"513100": 1.80}
-    o, d = strategy.plan_mix(0.0, {"513100": 1000}, px)
+    legs = mix_legs()
+    px = mix_px()
+    first = legs[0][0]
+    o, _d = strategy.plan_mix(0.0, {first: 1000}, px)
     check(not o, "权益为 0 时仍下了单：%s" % o)
-    o2, d2 = strategy.plan_mix(100000.0, {"513100": 1000}, px,
-                               dict(strategy.PARAMS, mix_weights={}))
+    o2, _d2 = strategy.plan_mix(100000.0, {first: 1000}, px,
+                                dict(strategy.PARAMS, mix_weights={}))
     check(not o2, "没有目标权重却下了单：%s" % o2)
     # 「调仓算不算完成」的判定：缺一只报价就是判不了，不能算到位。
     # 旧写法只看「有没有下过单」，会把半成品记成已完成，再等 342 天。
-    full = {"513100": 1.80, "518880": 3.60, "159915": 2.40}
-    ok_pos = {"513100": 22200, "518880": 8300, "159915": 12500}
-    check(strategy.mix_on_target(100000.0, ok_pos, full),
-          "三只都在带内却判成未到位")
-    check(not strategy.mix_on_target(100000.0, ok_pos,
-                                     {"513100": 1.80, "518880": 3.60}),
-          "缺 159915 报价却判成到位（等于把半成品记成已完成）")
-    check(not strategy.mix_on_target(100000.0,
-                                     {"513100": 40000, "518880": 8300,
-                                      "159915": 12500}, full),
+    ok_pos = mix_holdings(100000.0, px)
+    check(strategy.mix_on_target(100000.0, ok_pos, px),
+          "每条腿都在带内却判成未到位")
+    missing = legs[-1][0]
+    partial = {c: v for c, v in px.items() if c != missing}
+    check(not strategy.mix_on_target(100000.0, ok_pos, partial),
+          "缺 %s 报价却判成到位（等于把半成品记成已完成）" % missing)
+    blown = dict(ok_pos)
+    blown[first] = ok_pos[first] * 3
+    check(not strategy.mix_on_target(100000.0, blown, px),
           "权重脱靶却判成到位")
+
+
+@case("组合：整手粒度比带宽还粗时，必须说出来")
+def t_mix_granularity():
+    """2026-11-14 实测：511260（十年国债ETF）一手 100 份 = 13589 元。
+
+    10 万权益上一手就是 13.7%，比 12% 的带宽还粗：25% 的目标只能落在
+    13.7%（1 手）或 27.4%（2 手），两个位置**都判在带内**。于是差额永远
+    不会被修正、mix_on_target 判「到位」、流水上写着「补至 25%」实际只
+    买到 13.7%，剩下 11% 的钱一直躺在现金里。旧代码一句话都不说。
+    """
+    px = {"513100": 2.23, "518880": 7.954, "511260": 135.886}
+    params = dict(strategy.PARAMS,
+                  mix_weights={"513100": 0.45, "518880": 0.30, "511260": 0.25})
+    _orders, diag = strategy.plan_mix(99151.09, {}, px, params)
+    check(any("粒度" in d for d in diag),
+          "整手粒度粗到目标不可达，却没有一句告警：%s" % diag)
+    # 反向：便宜标的（一手只占 0.1%）不该跟着报这条噪音
+    cheap = {"513100": 1.80, "518880": 3.60, "511260": 1.20}
+    _o2, d2 = strategy.plan_mix(100000.0, {}, cheap, params)
+    check(not any("粒度" in d for d in d2),
+          "便宜标的也报了粒度告警（会变成每日噪音）：%s" % d2)
 
 
 @case("组合回测：建仓、再平衡、本金口径")
@@ -842,12 +935,15 @@ def t_bt_mix():
 
     mix 的决策在 plan_mix 里，decide 走不到它，于是回测返回 0 笔、
     doctor 报「与基线一致」——现役策略一次都没被回放。这条用例钉三件事：
-      1) 首日按 40/30/30 建满三只；
-      2) 隔夜一只翻倍触发再平衡时，只减不换、且卖出所得要投回去（不留大块现金）；
+      1) 首日把每条目标腿都建满；
+      2) 隔夜主腿翻倍触发再平衡时，只减不换、且卖出所得要投回去（不留大块现金）；
       3) metrics 的收益口径用回放本金，不靠调用方记得传参。
     """
     d1, d2 = "2026-11-02", "2026-11-03"
     n = len(session_minutes())
+    legs = mix_legs()
+    px = mix_px()
+    main = mix_main(legs)
 
     def mk(c, p1, p2):
         return {"name": c,
@@ -855,28 +951,30 @@ def t_bt_mix():
                          d2: mk_ticks(d2, flat_prices(n, p2))},
                 "preclose": {d1: p1, d2: p1}, "first_day_no_preclose": d1}
 
-    data = {"513100": mk("513100", 1.80, 3.60),      # 第二天翻倍
-            "518880": mk("518880", 3.60, 3.60),
-            "159915": mk("159915", 2.40, 2.40)}
+    data, last = {}, {}
+    for c, _w in legs:
+        p1 = px[c]
+        p2 = p1 * 2 if c == main else p1      # 主腿第二天翻倍
+        data[c] = mk(c, p1, p2)
+        last[c] = p2
     p = dict(strategy.PARAMS, mode="mix", mix_rebal_days=1)
     cap = 100000.0
     r = backtest.run_backtest(data, p, [d1, d2], capital=cap)
     d1_buys = [t for t in r["trades"] if t["day"] == d1 and t["side"] == "BUY"]
-    check(len(d1_buys) == 3, "首日应建三只，实际 %d 笔：%s"
-          % (len(d1_buys), [(t["code"]) for t in d1_buys]))
-    check(sorted(r["open_positions"]) == ["159915", "513100", "518880"],
+    check(len(d1_buys) == len(legs), "首日应建 %d 只，实际 %d 笔：%s"
+          % (len(legs), len(d1_buys), [t["code"] for t in d1_buys]))
+    check(sorted(r["open_positions"]) == sorted(c for c, _ in legs),
           "期末持仓不对：%s" % r["open_positions"])
     d2_sells = [t for t in r["trades"] if t["day"] == d2 and t["side"] == "SELL"]
-    check(len(d2_sells) == 1 and d2_sells[0]["code"] == "513100",
-          "再平衡应对且只对 513100 减仓：%s"
-          % [(t["code"], t["shares"]) for t in d2_sells])
-    before = [t["shares"] for t in d1_buys if t["code"] == "513100"][0]
+    check(len(d2_sells) == 1 and d2_sells[0]["code"] == main,
+          "再平衡应对且只对 %s 减仓：%s"
+          % (main, [(t["code"], t["shares"]) for t in d2_sells]))
+    before = [t["shares"] for t in d1_buys if t["code"] == main][0]
     check(0 < d2_sells[0]["shares"] < before,
           "减仓幅度不对：卖 %d / 建仓 %d" % (d2_sells[0]["shares"], before))
     eq_end = r["final"]
     # 卖出腾出的钱必须投回欠配的标的：期末现金占权益不应超过 8%
-    mv_end = sum(r["open_positions"][c] * px for c, px in
-                 (("159915", 2.40), ("513100", 3.60), ("518880", 3.60)))
+    mv_end = sum(sh * last[c] for c, sh in r["open_positions"].items() if c in last)
     cash_ratio = (eq_end - mv_end) / eq_end
     check(cash_ratio < 0.08,
           "再平衡后留了 %.1f%% 现金（卖出所得没投回去）" % (cash_ratio * 100))
@@ -2047,10 +2145,17 @@ def t_optimize_inert_dims():
                          d2: mk_ticks(d2, flat_prices(n, p2))},
                 "preclose": {d1: p1, d2: p1}, "first_day_no_preclose": d1}
 
-    # 513100 第二天翻倍：这才能让「再平衡周期」真的产生差别（平盘时
-    # 权重不漂移，调不调仓的结果一样，反而会把有效维度误判成无效）
-    data = {"513100": mk("513100", 1.80, 3.60), "518880": mk("518880", 3.60, 3.60),
-            "159915": mk("159915", 2.40, 2.40)}
+    # 主腿第二天翻倍：这才能让「再平衡周期」真的产生差别（平盘时
+    # 权重不漂移，调不调仓的结果一样，反而会把有效维度误判成无效）。
+    # 每条目标腿都必须喂数据：少一条腿，回测就只能建两只，
+    # mix_rebal_days 的差别被「第三只根本买不到」掩盖，有效维度会被误剔。
+    legs = mix_legs()
+    px = mix_px()
+    main = mix_main(legs)
+    data = {}
+    for c, _w in legs:
+        p1 = px[c]
+        data[c] = mk(c, p1, p1 * 2 if c == main else p1)
     p = dict(strategy.PARAMS, mode="mix", mix_rebal_days=244)
 
     # 1) mix 下日内参数无效：必须被判成 inert

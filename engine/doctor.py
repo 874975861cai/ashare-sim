@@ -896,8 +896,16 @@ def overnight_judgment(positions, today, hour, mode="daytrade", hold_target="",
         tgt = set(mix_codes or ())
         off = sorted({c for c, _ in stale if c not in tgt})
         if off:
-            return WARN, ("组合外持仓 %s（目标组合 %s），应由 plan_mix 的「移出组合」"
-                          "清掉；连续多日仍在说明清仓没执行成功"
+            # 2026-11-14 补：这里原来只有一种结论「清仓没执行成功」，但同一个
+            # 现象至少有两个成因，处理方式完全相反：
+            #   ① 云端真的没卖（被拦/失败/没跑到 09:35）→ 要查日志；
+            #   ② 本地 strategy.py 的配比改了但没推上去，云端仍按旧配比运行
+            #      → 账户里那只是旧配比的目标腿，压根不是「该卖没卖」。
+            # 混成一句话会让人去查一个根本不存在的执行故障（当天就是这样）。
+            return WARN, ("组合外持仓 %s（本地目标组合 %s）。两种成因，先分清再动手："
+                          "① 云端应按新配比卖出却没卖 → 查当日 09:35 日志有无「移出组合」；"
+                          "② 本地配比改动还没推上去、云端仍按旧配比运行 → 这种不是执行故障，"
+                          "核对远端 strategy.py 的 mix_weights 与本地是否一致"
                           % ("、".join(off), "/".join(mix_codes) or "未配置"))
         return OK, "%s 为组合持仓（mode=mix，共 %d 只），过夜属设计内" % (
             shown, len(tgt))
