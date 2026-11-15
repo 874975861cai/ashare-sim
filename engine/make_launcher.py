@@ -29,10 +29,32 @@
      检查 dashboard\\index.html 是否存在 —— 而它多半是上一次留下的，
      于是崩了也照样弹出页面，看着一切正常。现在先看退出码。
 
+2026-11-15 改（代码自审）：
+  f) **校验挪到落盘之前**。原实现先写文件、再读回来体检，不通过才
+     SystemExit —— 失败路径上磁盘留下的正好是那个坏文件，而坏文件就是
+     用户下次双击要执行的东西。「检查」的意义是不让它落盘，不是事后抱怨。
+     现在 payload() 先校验（ASCII / 无孤立 CR / 非空），落盘后只做回读比对，
+     比对不上就删掉半成品（杀软改写、磁盘占用都会造成这种残局）。
+  g) **解释器变更要说出来**。生成的脚本把 `sys.executable` 的绝对路径写死，
+     谁跑生成器谁说了算：在 .workbuddy 的 python 下跑一遍，14 个脚本就
+     全指向那个可能随升级消失的路径；doctor 的自动修复也是用当时的
+     sys.executable 重跑本脚本，等于「体检顺手换了所有启动脚本的解释器」。
+     现在覆盖前先比对旧文件里嵌的解释器，变了就单独打一行。
+  h) **停止脚本不再把「pid 文件内容不是数字」当成「进程不存在」**。
+     读出来是垃圾（NUL 字节、半截 JSON、手改过的行）时，旧流程一路走到
+     stale：删掉 pid 文件、宣告「Nothing was killed」、exit 0 —— 真跑着的
+     服务就此变成再也定位不到的孤儿。现在三态：没有 / 不是数字 / 是数字。
+  i) **StopAutoTrader 不再无条件删 runner.lock**。原来「没有 pid 文件」也
+     一路走到 cleanup 删锁；而锁是 O_EXCL 互斥、10 分钟才自愈——删掉一个
+     正在生效的锁等于放第二个 runner 进来同时写账本（lost update，
+     不报错，第二天 doctor 才发现）。现在只有「确认没有本地 runner 活着」
+     才删。
+
 用法：
     python engine/make_launcher.py
 """
 import os
+import re
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -104,7 +126,15 @@ STOP_LINES = [
     'if not exist "%PIDF%" goto nopid',
     "set SPID=",
     'set /p SPID=<"%PIDF%"',
-    "if not defined SPID goto nopid",
+    # 走到这一行说明**文件在**，只是读不出内容（0 字节 / NUL / 首行为空）。
+    # 报「No pid file」是假的：文件明明在，服务可能正在跑。
+    "if not defined SPID goto badpid",
+    # 数字闸门：pid 文件是程序写的，但会被 NUL 字节/半截写入/手改弄脏。
+    # 脏内容既不能拿去 taskkill（`1 & del ...` 会被 cmd 当成两条命令执行），
+    # 也不能当成「进程不存在」而删掉线索 —— 那是三态混成一态。
+    # 从**文件**里校验而不是 echo %SPID%|：变量一旦展开，& | 就已经生效了。
+    'findstr /R "^[0-9][0-9]*$" "%PIDF%" >nul 2>&1',
+    "if errorlevel 1 goto badpid",
 ] + _alive_lines("SPID") + [
     "if not defined ALIVE goto stale",
     'taskkill /PID %SPID% /F >nul 2>&1',
@@ -120,6 +150,15 @@ STOP_LINES = [
     "echo        Removed stale pid file. Nothing was killed.",
     "pause",
     "exit /b 0",
+    "",
+    ":badpid",
+    "echo [ERROR] pid file does not contain a plain number:",
+    "echo   %PIDF%",
+    "echo        Refusing to guess whether the server is running.",
+    "echo        The pid file was KEPT. Check it by hand, or delete it if",
+    "echo        you are sure no server is running.",
+    "pause",
+    "exit /b 1",
     "",
     ":killfail",
     "echo [ERROR] taskkill failed for pid %SPID% - pid file kept.",
@@ -289,10 +328,14 @@ STOP_TRADER_LINES = [
     'cd /d "' + ROOT + '"',
     'set PIDF=' + ROOT + r'\state\loop.pid',
     'set LOCKF=' + ROOT + r'\state\runner.lock',
-    'if not exist "%PIDF%" goto cleanup',
+    'if not exist "%PIDF%" goto nopid',
     "set LPID=",
     'set /p LPID=<"%PIDF%"',
-    "if not defined LPID goto cleanup",
+    # 文件在但读不出内容（0 字节/NUL/首行空）≠ 没有 pid 文件；报「Nothing to
+    # stop」会把一个可能还活着的孤儿说成没事。
+    "if not defined LPID goto badpid",
+    'findstr /R "^[0-9][0-9]*$" "%PIDF%" >nul 2>&1',
+    "if errorlevel 1 goto badpid",
 ] + _alive_lines("LPID") + [
     "if not defined ALIVE goto stale",
     "echo Stopping local auto-trader (pid %LPID%) ...",
@@ -306,12 +349,33 @@ STOP_TRADER_LINES = [
     "echo        Nothing was killed.",
     "goto cleanup",
     "",
+    # 只有走到这里才确定「没有本地 runner 活着」，锁才可以删。
+    # 没有 pid 文件不等于没有 runner：一次性 runner 不写 loop.pid，只建
+    # runner.lock（O_EXCL，10 分钟自愈）。旧版从「没有 pid 文件」直接
+    # 落到这里删锁，等于在别人写字的时候把门打开 —— 两个 runner 同时
+    # 写账本就是 lost update，不报错，第二天 doctor 才发现。
     ":cleanup",
     'del /q "%PIDF%" >nul 2>&1',
     'del /q "%LOCKF%" >nul 2>&1',
     "echo Done.",
     "pause",
     "exit /b 0",
+    "",
+    ":nopid",
+    "echo [INFO] No pid file. Nothing to stop.",
+    "echo        state\\runner.lock was left alone on purpose:",
+    "echo        a one-shot runner may be writing the ledger right now,",
+    "echo        and that lock is what keeps a second writer out.",
+    "echo        A dead lock expires on its own after 10 minutes.",
+    "pause",
+    "exit /b 0",
+    "",
+    ":badpid",
+    "echo [ERROR] pid file does not contain a plain number:",
+    "echo   %PIDF%",
+    "echo        Refusing to guess; pid file and lock were kept.",
+    "pause",
+    "exit /b 1",
     "",
     ":killfail",
     "echo [ERROR] taskkill failed for pid %LPID% - pid file kept.",
@@ -320,45 +384,110 @@ STOP_TRADER_LINES = [
 ]
 
 
-def _emit(name, lines):
-    """写一个 .bat，并且**根据自检结果决定要不要报错**。"""
+def payload(lines):
+    """把行列表做成一个**已在内存里校验过**的 .bat 字节流。
+
+    校验必须在落盘之前。否则失败路径上留下的就是那个坏文件本身——
+
+    三个硬约束（每一条都踩过坑）：
+      · 纯 ASCII：混进中文时 cmd 按单字节读会错位并截断路径；
+      · 只有 CRLF：纯 LF 的 .bat 会被 cmd 截断成 "'1' 不是内部或外部命令"；
+      · 非空。
+    """
+    if not [ln for ln in lines if str(ln).strip()]:
+        # 只有 "\r\n".join([]) 的话会变成单个空行 —— 那是个能「生成成功」的空脚本
+        raise ValueError("内容为空")
     try:
-        payload = ("\r\n".join(lines) + "\r\n").encode("ascii")
+        raw = ("\r\n".join(lines) + "\r\n").encode("ascii")
     except UnicodeEncodeError as e:
-        raise SystemExit("%s 含非 ASCII 字符（%r）：cmd 会按单字节读，路径会被截断"
-                         % (name, e.object[:40]))
+        raise ValueError("含非 ASCII 字符（%r）：cmd 会按单字节读，路径会被截断"
+                         % (e.object[:40],))
+    if not raw:
+        raise ValueError("内容为空")
+    naked = raw.replace(b"\r\n", b"")
+    if b"\n" in naked or b"\r" in naked:
+        # 孤立 CR 同样会把行切开，而老实现的 lf_only 只数 \n，看不见它
+        raise ValueError("出现孤立的 LF/CR（cmd 会在这里截断行）")
+    return raw
+
+
+_PY_RE = re.compile(rb"[A-Za-z]:\\[^\"\r\n]*pythonw?\.exe", re.I)
+
+
+def _embedded_python(raw):
+    """从已有脚本里抠出它写死的解释器路径，没有就返回空串。"""
+    m = _PY_RE.search(raw or b"")
+    return m.group(0).decode("ascii", "replace") if m else ""
+
+
+def _emit(name, lines):
+    """校验 → 落盘 → 回读比对。任何一步不过都不留下坏文件。"""
+    try:
+        data = payload(lines)
+    except ValueError as e:
+        raise SystemExit("%s 未写入：%s" % (name, e))
     path = os.path.join(ROOT, name)
+    old = b""
+    try:
+        with open(path, "rb") as f:
+            old = f.read()
+    except OSError:
+        old = b""
+    if old and old != data:
+        old_py, new_py = _embedded_python(old), _embedded_python(data)
+        if old_py and new_py and old_py.lower() != new_py.lower():
+            # 不拦，但必须让人看见：这条路径可能随 IDE/虚拟环境消失
+            print("  ! %-21s 解释器变更  %s  ->  %s" % (name, old_py, new_py))
     with open(path, "wb") as f:
-        f.write(payload)
+        f.write(data)
     with open(path, "rb") as f:
-        raw = f.read()
-    lf_only = raw.count(b"\n") - raw.count(b"\r\n")
-    non_ascii = any(c > 127 for c in raw)
-    print("%-24s %6d bytes  CRLF=%s  bare_LF=%d  ascii=%s"
-          % (name, len(raw), b"\r\n" in raw, lf_only, not non_ascii))
-    # 以前这里只 print，main() 照样 exit 0 —— 生成了一个坏文件也算成功
-    if not raw or lf_only or non_ascii:
-        raise SystemExit("%s 自检不通过：bare_LF=%d non_ascii=%s" % (name, lf_only, non_ascii))
-    return len(raw)
+        back = f.read()
+    if back != data:
+        try:
+            os.remove(path)          # 半成品比没文件更糟：它会被双击执行
+        except OSError:
+            pass
+        raise SystemExit("%s 写入后回读不一致（磁盘被占用/被改写？），已删除半成品。"
+                         % name)
+    print("%-24s %6d bytes  CRLF=True  bare_LF=0  ascii=True" % (name, len(back)))
+    return len(back)
+
+
+GROUPS = [
+    # (说明, 中文别名, 内容)
+    ("OpenDashboard.bat", "\u6253\u5f00\u6a21\u62df\u76d8.bat", LINES),
+    ("StopServer.bat", "\u505c\u6b62\u5b9e\u65f6\u670d\u52a1.bat", STOP_LINES),
+    ("InstallAutostart.bat", "\u5b89\u88c5\u5f00\u673a\u81ea\u542f.bat", INSTALL_LINES),
+    ("QuickView.bat", "\u5feb\u901f\u67e5\u770b.bat", FAST_LINES),
+    ("FixPower.bat", "\u8bbe\u7f6e\u4e0d\u4f11\u7720.bat", POWER_LINES),
+    ("StartAutoTrader.bat", "\u542f\u52a8\u81ea\u52a8\u4ea4\u6613.bat", TRADER_LINES),
+    ("StopAutoTrader.bat", "\u505c\u6b62\u81ea\u52a8\u4ea4\u6613.bat", STOP_TRADER_LINES),
+]
+
+
+def all_payloads():
+    """14 个脚本的「应该长什么样」，供 doctor 比对磁盘。
+
+    为什么要暴露出来：.bat 在 .gitignore 里，模板改了但没人重跑生成器时，
+    磁盘上的一直是旧脚本 —— 编码检查永远发现不了这种漂移（10-23 漂过一次：
+    16:04 生成、16:06 改模板）。doctor 拿这份清单才能既查「缺没缺」，
+    也查「内容与模板一致吗」。
+    """
+    out = {}
+    for ascii_name, cn_name, lines in GROUPS:
+        out[ascii_name] = payload(lines)
+        out[cn_name] = payload(lines)
+    return out
 
 
 def main():
-    groups = [
-        # (说明, 中文别名, 内容)
-        ("OpenDashboard.bat", "\u6253\u5f00\u6a21\u62df\u76d8.bat", LINES),
-        ("StopServer.bat", "\u505c\u6b62\u5b9e\u65f6\u670d\u52a1.bat", STOP_LINES),
-        ("InstallAutostart.bat", "\u5b89\u88c5\u5f00\u673a\u81ea\u542f.bat", INSTALL_LINES),
-        ("QuickView.bat", "\u5feb\u901f\u67e5\u770b.bat", FAST_LINES),
-        ("FixPower.bat", "\u8bbe\u7f6e\u4e0d\u4f11\u7720.bat", POWER_LINES),
-        ("StartAutoTrader.bat", "\u542f\u52a8\u81ea\u52a8\u4ea4\u6613.bat", TRADER_LINES),
-        ("StopAutoTrader.bat", "\u505c\u6b62\u81ea\u52a8\u4ea4\u6613.bat", STOP_TRADER_LINES),
-    ]
     total = 0
-    for ascii_name, cn_name, lines in groups:
+    for ascii_name, cn_name, lines in GROUPS:
         total += _emit(ascii_name, lines)
         total += _emit(cn_name, lines)
     print("-" * 60)
-    print("共 %d 个脚本，%d 字节。全部 ASCII + CRLF。" % (len(groups) * 2, total))
+    print("共 %d 个脚本，%d 字节。全部 ASCII + CRLF。" % (len(GROUPS) * 2, total))
+    print("解释器：%s" % PYW)
     return 0
 
 

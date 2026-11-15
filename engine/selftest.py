@@ -52,7 +52,7 @@ VERBOSE = False
 CASES = []
 # 用例总数基线（见 main() 里的说明：少了要红，不是"通过 41 项"）。
 # 2026-10-19 建 1 条起算，每加一条用例都要同步改这里。
-EXPECTED_CASES = 77
+EXPECTED_CASES = 79
 
 
 def case(name):
@@ -1415,6 +1415,49 @@ def t_cloud_pool_vs_no_quotes():
           "没报价是数据源故障，应返回 3，实际 %s" % code_map["code_no_quotes"])
     check(code_map["code_pool_filtered"] == 6,
           "没过门槛属正常跳过，应返回 6，实际 %s" % code_map["code_pool_filtered"])
+
+
+@case("启动脚本：校验在落盘之前，且 14 个脚本全 ASCII+CRLF")
+def test_launcher_payload():
+    import make_launcher
+    p = make_launcher.all_payloads()
+    check(len(p) == 14, "应生成 14 个脚本（7 组 × 中英名），实际 %d 个" % len(p))
+    for name, raw in p.items():
+        check(raw.endswith(b"\r\n"), "%s 不是 CRLF 结尾" % name)
+        naked = raw.replace(b"\r\n", b"")
+        check(b"\n" not in naked and b"\r" not in naked,
+              "%s 有孤立的 LF/CR：cmd 会在那里截断行" % name)
+        check(all(c < 128 for c in raw), "%s 含非 ASCII" % name)
+    # 三个硬约束必须由 payload() 在**落盘之前**拒绝（老实现是先写再查，
+    # 失败路径上留下的坏文件正是下次双击要执行的那个）
+    for bad in (["echo \u4e2d\u6587"], ["echo a\recho b"], []):
+        try:
+            make_launcher.payload(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("payload(%r) 应被拒，实际通过了" % (bad,))
+
+
+@case("启动脚本：pid 文件读不出数字时不许当成「进程不存在」")
+def test_launcher_pid_guard():
+    import make_launcher
+    p = make_launcher.all_payloads()
+    guard = b'findstr /R "^[0-9][0-9]*$"'
+    for name in ("StopServer.bat", "StopAutoTrader.bat"):
+        raw = p[name]
+        check(guard in raw, "%s 缺数字闸门：脏 pid 会被直接喂给 taskkill" % name)
+        check(b":badpid" in raw, "%s 没有 badpid 分支" % name)
+        check(raw.index(guard) < raw.index(b"taskkill /PID"),
+              "%s 的 taskkill 出现在数字校验之前" % name)
+        # 文件在但读不出内容时会跳到 badpid，不再谎报「No pid file」
+        check(b"if not defined SPID goto badpid" in raw
+              or b"if not defined LPID goto badpid" in raw,
+              "%s 仍把「读不出内容」当成「没有 pid 文件」" % name)
+    # 「没有 pid 文件」分支绝不能删锁：一次性 runner 不写 loop.pid，只建
+    # runner.lock（O_EXCL，10 分钟自愈）。在这里删锁＝放第二个写者进来。
+    seg = p["StopAutoTrader.bat"].split(b":nopid", 1)[1].split(b":badpid", 1)[0]
+    check(b"del /q" not in seg, "StopAutoTrader 的 nopid 分支删了文件（会删掉正在生效的锁）")
 
 
 # ==========================================================================

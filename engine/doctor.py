@@ -1126,35 +1126,97 @@ def _fix_bat(path):
         return False
 
 
+def _expected_bats():
+    """生成器认为磁盘上应该有什么。拿不到就返回 None（退化成只查编码）。"""
+    try:
+        sys.path.insert(0, ENGINE)
+        import make_launcher
+        return make_launcher.all_payloads()
+    except Exception:            # 生成器自己坏了，不能把体检也带崩
+        return None
+
+
 def check_bats():
-    bad = []
-    bats = [f for f in os.listdir(ROOT) if f.lower().endswith((".bat", ".cmd"))]
-    for fn in bats:
-        p = _bat_problem(os.path.join(ROOT, fn))
-        if p:
-            bad.append(fn + "(%s)" % p)
-    if not bad:
-        add(OK, "代码", "启动脚本", "%d 个 .bat 全部 CRLF+ASCII" % len(bats))
+    """启动脚本：编码要对，**该有的必须在、内容得跟模板一致**。
+
+    2026-11-15 修（代码自审，make_launcher 唯一的下游消费者）：
+
+    ① 空集曾被判合规。旧实现只遍历磁盘上现有的 .bat，于是「一个都没有」
+       也会打印「0 个 .bat 全部 CRLF+ASCII」并给 OK。而 *.bat 在
+       .gitignore 里 —— 新克隆、换机器上 14 个启动脚本全缺，体检照样绿，
+       直到用户双击某个快捷方式才发现它不存在。
+    ② 只查编码，查不出「模板改了但没人重跑生成器」。2026-10-23 就漂过一次：
+       16:04 生成、16:06 改模板，磁盘上一直是旧脚本，三周没人发现。.bat 是
+       仓库外文件，这是唯一会安静漂移的东西，必须拿模板正面比对。
+    """
+    expected = _expected_bats()
+    on_disk = [f for f in os.listdir(ROOT) if f.lower().endswith((".bat", ".cmd"))]
+    if os.name != "nt":
+        # .bat 是 Windows 专用的；在 Linux（CI/容器）上「缺 14 个」是必然，
+        # 天天报一条 WARN 只会训练人忽略这条检查。
+        add(OK, "代码", "启动脚本", "非 Windows 环境，跳过 .bat 检查")
         return
-    if not DO_FIX:
-        add(CRIT, "代码", "启动脚本", "编码异常：" + "、".join(bad))
+    if expected is None:
+        add(WARN, "代码", "启动脚本", "生成器导入失败，只能查编码（查不出缺失与漂移）")
+        expected = {}
+
+    bad = [fn + "(%s)" % _bat_problem(os.path.join(ROOT, fn))
+           for fn in on_disk if _bat_problem(os.path.join(ROOT, fn))]
+    missing = sorted(n for n in expected if n not in on_disk)
+    drift = []
+    for n, want in expected.items():
+        if n in on_disk:
+            try:
+                with open(os.path.join(ROOT, n), "rb") as f:
+                    if f.read() != want:
+                        drift.append(n)
+            except OSError:
+                pass
+    extra = sorted(f for f in on_disk if f not in expected)
+
+    if not bad and not missing and not drift:
+        note = "%d 个 .bat 全部 CRLF+ASCII，与生成器模板一致" % len(on_disk)
+        if extra:
+            note += "（另有 %d 个非生成器维护：%s）" % (len(extra), "、".join(extra[:3]))
+        add(OK, "代码", "启动脚本", note)
         return
 
-    # 先让 make_launcher 重建它自己维护的脚本（保持内容与模板一致）
-    subprocess.run([sys.executable, os.path.join(ENGINE, "make_launcher.py")],
-                   capture_output=True)
-    # 再复查一遍，剩下的（通常就是用户新加的）自己动手修
+    parts = []
+    if missing:
+        parts.append("缺 %d 个（%s%s）" % (len(missing), "、".join(missing[:3]),
+                                          "…" if len(missing) > 3 else ""))
+    if drift:
+        parts.append("%d 个与模板不一致（%s%s）" % (len(drift), "、".join(drift[:3]),
+                                                "…" if len(drift) > 3 else ""))
+    if bad:
+        parts.append("编码异常（%s）" % "、".join(bad[:3]))
+    head = "；".join(parts) + "。跑 python engine/make_launcher.py 重建"
+
+    if not DO_FIX:
+        add(CRIT if bad else WARN, "代码", "启动脚本", head)
+        return
+
+    # 生成器按模板重建它维护的那些（内容、换行、编码一次到位）
+    r = subprocess.run([sys.executable, os.path.join(ENGINE, "make_launcher.py")],
+                       capture_output=True)
+    if r.returncode != 0:
+        tail = (r.stderr or r.stdout or b"").decode("utf-8", "replace").strip().splitlines()
+        add(WARN, "代码", "启动脚本", "%s；但生成器返回 %d：%s"
+            % (head, r.returncode, tail[-1] if tail else "无输出"))
+    # 生成器不维护的（用户自己加的）才就地修编码
     still = []
-    for fn in bats:
+    for fn in on_disk:
+        if fn in expected:
+            continue
         path = os.path.join(ROOT, fn)
         if _bat_problem(path):
             _fix_bat(path)
             if _bat_problem(path):
                 still.append(fn)
     if still:
-        add(CRIT, "代码", "启动脚本", "编码异常且无法自动修复：" + "、".join(still))
-    else:
-        add(FIX, "代码", "启动脚本", "编码异常已重写：" + "、".join(bad[:4]))
+        add(CRIT, "代码", "启动脚本", "非生成器脚本编码异常且无法自动修复：" + "、".join(still))
+    elif r.returncode == 0:
+        add(FIX, "代码", "启动脚本", "已按模板重建：" + "；".join(p for p in parts if p))
 
 
 def check_deps():
