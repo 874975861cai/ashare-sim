@@ -38,6 +38,9 @@ SPACING = 6             # 每只之间间隔，避开东财分钟级限流
 # 这些异常说明代码或数据结构坏了，不是限流。重试只会把 bug 拖成 75 秒的「限流」，
 # 最后在 fail 里留一个代码，读日志的人看不出是代码问题。
 NO_RETRY = (KeyError, IndexError, TypeError, AttributeError, NameError)
+# 连续这么多只标的「重试到底仍是降级」就不再重试后面的：这说明整条接口挂了，
+# 再逐只等 75 秒只是把盘前例行拖成一个小时，刷不回来一分数据。
+GIVE_UP_STREAK = 3
 
 
 def _classify(tr, ndays):
@@ -70,15 +73,17 @@ def warm(codes=None, ndays=NDAYS, verbose=True):
     last_day = {}       # code -> 最后一根分时的日期
     total = len(codes)
 
+    stale_streak = 0    # 连续「重试到底仍是降级」的标的数，见 GIVE_UP_STREAK
     for i, c in enumerate(codes, 1):
         tr = None
+        state = note = ""
         for attempt in range(ATTEMPTS):
             try:
                 tr = market.fetch_trends(c, ndays=ndays, ttl=0)
-                break
             except NO_RETRY:
                 raise
             except Exception as e:  # noqa: BLE001
+                tr = None
                 if attempt == ATTEMPTS - 1:
                     kind = type(e).__name__
                     if verbose:
@@ -91,12 +96,35 @@ def warm(codes=None, ndays=NDAYS, verbose=True):
                         print("[%d/%d] %s 重试中，等待 %ds… (%s)"
                               % (i, total, c, wait, str(e)[:60]))
                     time.sleep(wait)
+                continue
+
+            state, note = _classify(tr, ndays)
+            if state == "fresh":
+                break
+            # 降级 = 这一次没刷到，只是拿旧文件顶上。对「把缓存刷到今天」来说
+            # 它就是失败，必须重试。原实现这里直接 break 去记账，重试分支只对
+            # **完全没有缓存**的标的生效（那种情况 fetch_trends 才抛错），于是
+            # 最常见的情形——接口抽风、旧文件还在——一次都不重试：
+            # 2026-11-16 实测 12/15 只第一次降级就定了稿，而同一台机器隔几分钟
+            # 再连同一个主机就能拉通；反倒是不带缓存的 511260 老老实实等了 25s/50s。
+            # 代价可控：一次降级约 30s（内部已含 5 次快重试），比一整天拿旧数据算
+            # 回归基线便宜得多。partial（停牌/新股/接口截断）不重试，重试也变不出
+            # 那几天的行情。
+            if state == "stale" and attempt < ATTEMPTS - 1 and stale_streak < GIVE_UP_STREAK:
+                wait = WAIT_BASE * (attempt + 1)
+                if verbose:
+                    print("[%d/%d] %s 降级，重试中，等待 %ds… (%s)"
+                          % (i, total, c, wait, note[:50]))
+                time.sleep(wait)
+                continue
+            break
         if tr is None:
             continue
 
         state, note = _classify(tr, ndays)
         buckets[state].append(c)
         why[c] = note
+        stale_streak = stale_streak + 1 if state == "stale" else 0
         ticks = tr.get("ticks") or []
         days = sorted({t["t"][:10] for t in ticks})
         last_day[c] = days[-1] if days else None
