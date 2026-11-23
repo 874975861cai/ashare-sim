@@ -349,6 +349,24 @@ def selftest_replay():
     fails += selftest_sync()
     fails += selftest_overnight()
     fails += selftest_watch_window()
+    fails += selftest_mirror_lag()
+    return fails
+
+
+def selftest_mirror_lag():
+    """镜像滞后的三种判定。写反的后果是「落后」被当成「分叉」而不修，
+    或「分叉」被当成「落后」而把别人的提交盖掉。"""
+    fails = []
+    cases = [
+        ((0, 0), "uptodate", "两边一致"),
+        ((4, 0), "behind", "只落后，可以快进"),
+        ((4, 2), "diverged", "本地也有提交，不能自动合并"),
+        ((0, 3), "diverged", "本地领先远端，属分叉"),
+    ]
+    for (args, want, why) in cases:
+        if mirror_lag_judgment(*args) != want:
+            fails.append("镜像滞后判定错误（%s）：%s -> %s，应为 %s"
+                         % (why, args, mirror_lag_judgment(*args), want))
     return fails
 
 
@@ -712,6 +730,68 @@ def check_mirror():
         "本地 cash %.2f / 持仓 %d / 已平 %d 笔。账本在云端，本地这份只是副本，"
         "先同步再复盘"
         % (r_cash, int(r_pos), int(r_sell), local_cash, local_pos, local_sell))
+
+
+def mirror_lag_judgment(behind, ahead):
+    """本地副本与远端的相对位置。纯函数，方便自测。
+
+    ahead > 0 时不能自动合并：本地有未推送的提交，快进会失败或造成分叉。
+    """
+    if behind <= 0 and ahead <= 0:
+        return "uptodate"
+    if ahead > 0:
+        return "diverged"
+    return "behind"
+
+
+def check_mirror_lag():
+    """本地镜像落后远端多少个提交——不看钟点的硬证据。
+
+    2026-11-23 发现：本地账本停在 11-17，之后 11-18/19/20/23 四个交易日的
+    云端提交一个都没拉下来，体检却全绿跑了四天。原因是唯一会 fetch 的路径
+    （任务心跳）只在对账窗口 10:00-16:30 内跑，而这个体检定点 16:49 触发，
+    永远落在窗口外——闸门等于关着。而「镜像同步」只比 cash/持仓/笔数，
+    没有成交的日子两边恒等，兜不住这种落后（10-30 就记过这条）。
+
+    所以这里补一条与时间无关的判断：正常时段比对 + 快进合并，合并只走
+    _sync_local_ledger（落后且无冲突才动，绝不覆盖未提交改动）。
+    """
+    if _git("rev-parse", "--is-inside-work-tree")[0] != 0:
+        return
+    if _git("fetch", "--quiet", "origin", "main", timeout=45)[0] != 0:
+        return  # 网络抖动与账本无关，不喊；缺口由「任务心跳」在窗口内兜
+
+    b, a = _git("rev-list", "--count", "HEAD..origin/main")[1], \
+        _git("rev-list", "--count", "origin/main..HEAD")[1]
+    try:
+        behind, ahead = int((b or "").strip() or 0), int((a or "").strip() or 0)
+    except ValueError:
+        return
+
+    verdict = mirror_lag_judgment(behind, ahead)
+    if verdict == "uptodate":
+        add(OK, "账本", "镜像版本", "与远端一致（%s）" % _git("rev-parse", "--short", "HEAD")[1].strip())
+        return
+    if verdict == "diverged":
+        add(WARN, "账本", "镜像版本",
+            "本地领先 %d / 落后 %d 个提交，可能另有写者在同一仓库工作；"
+            "不自动合并，确认后再处理" % (ahead, behind))
+        return
+
+    if DO_FIX:
+        synced, detail = _sync_local_ledger()
+        if synced:
+            add(FIX, "账本", "镜像版本",
+                "本地镜像落后 %d 个提交，已快进合并至 %s（账本最后净值行 %s）"
+                % (behind, _git("rev-parse", "--short", "HEAD")[1].strip(),
+                   _ledger_last_day() or "无"))
+            return
+        detail = detail.strip("；") if detail else ""
+    else:
+        detail = "--no-fix，未尝试同步"
+    add(WARN, "账本", "镜像版本",
+        "本地镜像落后远端 %d 个提交，账本最后净值行 %s；%s"
+        % (behind, _ledger_last_day() or "无", detail or "合并未成功"))
 
 
 def ledger_watch_active(weekday, hm):
@@ -1756,6 +1836,7 @@ def main():
     port = check_service()
     check_page(port)
     check_heartbeat()
+    check_mirror_lag()
     check_mirror()
     check_ledger()
     check_py_compile()
