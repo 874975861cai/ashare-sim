@@ -851,13 +851,21 @@ def _actions_runs():
         return None, "origin 不是 github 仓库"
     api = ("https://api.github.com/repos/%s/%s/actions/runs?per_page=20"
            % (m.group(1), m.group(2)))
-    try:
-        req = urllib.request.Request(api, headers={"User-Agent": "ashare-sim-doctor"})
-        with urllib.request.urlopen(req, timeout=8) as r:
-            d = json.loads(r.read().decode("utf-8"))
-    except Exception as e:  # noqa: BLE001
-        return None, "查 Actions 失败：%s" % type(e).__name__
-    return (d.get("workflow_runs") or []), ""
+    # 重试一次：2026-11-24 实测同一个 URL 在 8 秒超时下偶发 RemoteDisconnected
+    # （紧接着手工复测 3 次全成功），单次失败就把「云端跑没跑」降级成 WARN，
+    # 等于用一次网络抖动换一条假警报。两次都失败才算查不到。
+    err = ""
+    for attempt in range(2):
+        try:
+            req = urllib.request.Request(api, headers={"User-Agent": "ashare-sim-doctor"})
+            with urllib.request.urlopen(req, timeout=8) as r:
+                d = json.loads(r.read().decode("utf-8"))
+            return (d.get("workflow_runs") or []), ""
+        except Exception as e:  # noqa: BLE001
+            err = "查 Actions 失败：%s" % type(e).__name__
+            if attempt == 0:
+                time.sleep(0.8)
+    return None, err
 
 
 def check_heartbeat():
