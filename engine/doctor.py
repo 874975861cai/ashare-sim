@@ -349,6 +349,7 @@ def selftest_replay():
     fails += selftest_sync()
     fails += selftest_overnight()
     fails += selftest_watch_window()
+    fails += selftest_cloud_window()
     fails += selftest_mirror_lag()
     return fails
 
@@ -444,6 +445,26 @@ def selftest_watch_window():
     for wd, hm, want, why in cases:
         if ledger_watch_active(wd, hm) != want:
             fails.append("对账窗口错误（%s）：%s@%s" % (why, wd, hm))
+    return fails
+
+
+def selftest_cloud_window():
+    """「云端没跑」的判据必须晚于云端首轮，否则每天早上都要假警报一次。
+
+    2026-11-26 12:57 实测：账本缺今日行、Actions 无今日记录，被判 WARN，
+    而云端首轮 13:05 才派工。09:36~13:05 是 11-11~11-25 的实测首轮区间。
+    """
+    fails = []
+    cases = [
+        ("12:57", False, "实测踩到的时点，云端确实还没开工"),
+        ("13:09", False, "首轮 13:05 派工 + 排队，还留有余量"),
+        ("13:10", True, "到点仍无记录才算漏跑"),
+        ("14:00", True, "盘中无记录必须报"),
+        ("16:00", True, "收盘后无记录更要报"),
+    ]
+    for hm, want, why in cases:
+        if cloud_run_overdue(hm) != want:
+            fails.append("云端首轮判据错误（%s）：%s 应为 %s" % (why, hm, want))
     return fails
 
 
@@ -794,6 +815,23 @@ def check_mirror_lag():
         % (behind, _ledger_last_day() or "无", detail or "合并未成功"))
 
 
+# 云端每日首轮的「最晚已到点」时刻（北京时间）。
+# 2026-11-11~11-25 逐日统计 api.github.com 的首次运行：落在 09:36~13:05，
+# 由 Cloudflare Worker 的 05:05Z 派工兜底（GitHub 自己的 schedule 偶尔更早）。
+# 13:05 之前账本没有今日净值行、Actions 也没有今天的记录，只说明云端还没开工。
+CLOUD_FIRST_RUN_BY = "13:10"
+
+
+def cloud_run_overdue(hm):
+    """现在是否已过「云端今天必然跑过一轮」的时点。纯函数，方便自测。
+
+    2026-11-26 踩过：体检定点 12:57 跑到，「今日无成功执行」直接报了 WARN，
+    可云端首轮要到 13:05 才派工。这种抢跑式告警每个交易日早上都会来一遍，
+    喊多了真没跑那天就没人信了。早于 CLOUD_FIRST_RUN_BY 一律不判漏跑。
+    """
+    return hm >= CLOUD_FIRST_RUN_BY
+
+
 def ledger_watch_active(weekday, hm):
     """现在该不该拿「今天的净值行」去追究自动化。纯函数，方便自测。
 
@@ -906,7 +944,10 @@ def check_heartbeat():
     if active:
         # 缺今日净值行时，先分清「云端没跑」还是「本地没拉」，别冤枉云端
         synced, detail = _sync_local_ledger()
-        if synced and _ledger_last_day() == today:
+        # 同步完必须重读：2026-11-26 就是拿同步前的 11-23 去报了「最后净值行」，
+        # 同一句里却又写着「现已快进合并」，自相矛盾且看不出真实进度。
+        led_day = _ledger_last_day() or led_day
+        if synced and led_day == today:
             add(FIX, "运行时", "任务心跳",
                 "本地副本过期，已从云端同步并写入今日账本%s" % note)
             return
@@ -920,10 +961,18 @@ def check_heartbeat():
         # 只因无成交未提交，体检照样报「可能没跑」）。
         runs, why = _actions_runs()
         n, last_t = cloud_run_evidence(runs, today)
+        head = "%s但今天账本还没有净值行（最后 %s）" % (seg, led_day or "无")
+        fixed = "本地副本过期，已从云端同步；" if synced else ""
         if n and hm < "15:30":
-            add(OK, "运行时", "任务心跳",
-                "云端今日已执行 %d 轮（最后 %s）；今日无成交，按提交策略盘中不入库，"
-                "本地镜像没有今日净值行属正常%s" % (n, last_t, note))
+            add(FIX if synced else OK, "运行时", "任务心跳",
+                "%s云端今日已执行 %d 轮（最后 %s）；今日无成交，按提交策略盘中不入库，"
+                "本地镜像没有今日净值行属正常%s" % (fixed, n, last_t, note))
+            return
+        if not n and not cloud_run_overdue(hm):
+            # 抢跑告警：13:10 之前云端本来就还没派工，没记录不是故障。
+            add(FIX if synced else OK, "运行时", "任务心跳",
+                "%s%s，尚未到云端首轮（通常北京 %s 前派工），不判漏跑%s"
+                % (fixed, head, CLOUD_FIRST_RUN_BY, note))
             return
         if n:
             why = "；云端今日已执行 %d 轮（最后 %s），但账本没有今日净值行" % (n, last_t)
@@ -932,8 +981,7 @@ def check_heartbeat():
         else:
             why = "；云端今日没有成功执行的记录"
         add(WARN, "运行时", "任务心跳",
-            "%s但今天账本还没有净值行（最后 %s），云端自动化可能没跑%s%s"
-            % (seg, led_day or "无", detail, why))
+            "%s，云端自动化可能没跑%s%s" % (head, detail, why))
         return
 
     if hb_dt is not None:
