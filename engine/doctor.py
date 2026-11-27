@@ -1891,8 +1891,13 @@ def main():
 
     port = check_service()
     check_page(port)
-    check_heartbeat()
+    # 镜像必须在心跳之前：两者都靠「账本最后净值行」说话。2026-11-27 实测
+    # 09:50 那轮，镜像先快进到 840dafc（11-26 行已落地），而心跳在 09:50 就
+    # 读完了 led_day，同一张表里一行报 11-26、另一行报 11-25。11-26 的修复
+    # 只在「对账窗口内」重读了一次，窗口外（10:00 之前）这条路径没覆盖。
+    # 调序后心跳读到的就是快进后的账本，不需要再各自 fetch 一次。
     check_mirror_lag()
+    check_heartbeat()
     check_mirror()
     check_ledger()
     check_py_compile()
